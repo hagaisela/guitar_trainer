@@ -1,15 +1,16 @@
+import os
 import gi
+# Specify versions before importing gi modules
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
 gi.require_version('Gst', '1.0')
 gi.require_version('GstVideo', '1.0')
 from gi.repository import Gtk, Gdk, GLib, Gst, GstVideo
-import os
-import yt_dlp
-import threading
-import sys
-import math
 import traceback
+import math
+import sys
+import threading
+import yt_dlp
 from collections import deque
 try:
     import numpy as np
@@ -27,26 +28,29 @@ except Exception as e:
 
 print("Starting application...")
 
+
 class GuitarTrainerApp(Gtk.Window):
     def __init__(self):
         print("Initializing GuitarTrainerApp...")
         super().__init__()
         self.set_title("Guitar Tutorial Player")
         self.set_default_size(800, 600)
-        
+
         # Initialize GStreamer
         print("Initializing GStreamer...")
         Gst.init(None)
         self.pipeline = None
         self.playbin = None
         self.videosink = None
-        
+
         # Create main layout
-        self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.main_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.add(self.main_box)
-        
+
         # URL entry
-        self.url_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        self.url_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         self.url_entry = Gtk.Entry()
         self.url_entry.set_placeholder_text("Enter YouTube URL")
         self.download_button = Gtk.Button(label="Download")
@@ -54,29 +58,41 @@ class GuitarTrainerApp(Gtk.Window):
         self.url_box.pack_start(self.url_entry, True, True, 0)
         self.url_box.pack_start(self.download_button, False, False, 0)
         self.main_box.pack_start(self.url_box, False, False, 0)
-        
+
         # Status label
         self.status_label = Gtk.Label(label="")
         self.main_box.pack_start(self.status_label, False, False, 0)
-        
+
         # Video area
         self.video_area = Gtk.Box()  # Changed from DrawingArea to Box
         self.video_area.set_hexpand(True)
         self.video_area.set_vexpand(True)
         self.main_box.pack_start(self.video_area, True, True, 0)
+
+        # Ensure slider clicks warp directly to the clicked position
+        settings = Gtk.Settings.get_default()  # pylint: disable=no-value-for-parameter
+        if settings is not None:
+            try:
+                settings.set_property("gtk-primary-button-warps-slider", True)
+            except TypeError:
+                # Fallback for older GTK versions where the property might not exist
+                pass
         
         # Speed control
-        self.speed_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        self.speed_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         self.speed_label = Gtk.Label(label="Playback Speed:")
-        self.speed_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.25, 2.0, 0.25)
+        self.speed_scale = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0.25, 2.0, 0.25)
         self.speed_scale.set_value(1.0)
         self.speed_scale.connect("value-changed", self.on_speed_changed)
         self.speed_box.pack_start(self.speed_label, False, False, 0)
         self.speed_box.pack_start(self.speed_scale, True, True, 0)
         self.main_box.pack_start(self.speed_box, False, False, 0)
-        
+
         # Playback controls
-        self.control_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        self.control_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         self.play_button = Gtk.Button(label="Play")
         self.play_button.connect("clicked", self.on_play_clicked)
         self.pause_button = Gtk.Button(label="Pause")
@@ -84,7 +100,7 @@ class GuitarTrainerApp(Gtk.Window):
         self.control_box.pack_start(self.play_button, False, False, 0)
         self.control_box.pack_start(self.pause_button, False, False, 0)
         self.main_box.pack_start(self.control_box, False, False, 0)
-        
+
         # Initialize video path
         self.video_path = None
         self.pitch_buffer = None  # numpy array for accumulating audio samples
@@ -99,18 +115,19 @@ class GuitarTrainerApp(Gtk.Window):
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
             print("Set existing pipeline to NULL state")
-        
+
         try:
             # Create pipeline elements
             self.pipeline = Gst.Pipeline.new("pipeline")
             self.playbin = Gst.ElementFactory.make("playbin", "playbin")
-            
+
             # Create video sink
             self.videosink = Gst.ElementFactory.make("gtkglsink", "videosink")
             if not self.videosink:
                 print("gtkglsink not available, trying gtksink")
-                self.videosink = Gst.ElementFactory.make("gtksink", "videosink")
-            
+                self.videosink = Gst.ElementFactory.make(
+                    "gtksink", "videosink")
+
             if self.videosink:
                 try:
                     # Make sure video frames are displayed in sync with the pipeline clock
@@ -119,7 +136,7 @@ class GuitarTrainerApp(Gtk.Window):
                 except TypeError:
                     print("Could not set sync property on videosink")
                     pass  # some versions may not expose the property
-            
+
             # Build an audio sink bin with scaletempo for pitch-preserving time stretching
             audio_sink_desc = (
                 "audioconvert ! audioresample ! scaletempo name=st ! tee name=split "
@@ -127,25 +144,26 @@ class GuitarTrainerApp(Gtk.Window):
                 "split. ! queue ! audioconvert ! audioresample ! capsfilter caps=audio/x-raw,format=F32LE,channels=1 ! "
                 "appsink name=pitchsink emit-signals=true sync=false max-buffers=5 drop=true"
             )
-            self.audio_sink_bin = Gst.parse_bin_from_description(audio_sink_desc, True)
+            self.audio_sink_bin = Gst.parse_bin_from_description(
+                audio_sink_desc, True)
 
             # Retrieve the appsink for pitch detection
             self.pitchsink = self.audio_sink_bin.get_by_name("pitchsink")
             if self.pitchsink:
                 self.pitchsink.connect("new-sample", self.on_pitch_sample)
-            
+
             # Retrieve the scaletempo element and make sure it's set up correctly
             self.scaletempo = self.audio_sink_bin.get_by_name("st")
             if self.scaletempo:
                 self.scaletempo.set_property("stride", 30)
                 self.scaletempo.set_property("overlap", 0.2)
                 print("Configured scaletempo element")
-            
+
             if not self.playbin or not self.videosink:
                 print("Failed to create elements")
                 self.update_status("Failed to create video player")
                 return
-            
+
             # Get the widget from the sink and add it to our video area
             sink_widget = self.videosink.get_property("widget")
             if sink_widget:
@@ -168,25 +186,26 @@ class GuitarTrainerApp(Gtk.Window):
                 self.pitch_label.set_margin_start(10)
                 self.pitch_label.set_margin_top(10)
                 # Style: yellow text for visibility
-                self.pitch_label.override_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(1, 1, 0, 1))
+                self.pitch_label.override_color(
+                    Gtk.StateFlags.NORMAL, Gdk.RGBA(1, 1, 0, 1))
                 overlay.add_overlay(self.pitch_label)
 
                 self.video_area.pack_start(overlay, True, True, 0)
                 sink_widget.show()
                 overlay.show_all()
-            
+
             # Set up the sinks
             self.playbin.set_property("video-sink", self.videosink)
             self.playbin.set_property("audio-sink", self.audio_sink_bin)
-            
+
             # Add playbin to pipeline
             self.pipeline.add(self.playbin)
-            
+
             # Add a message handler
             bus = self.pipeline.get_bus()
             bus.add_signal_watch()
             bus.connect('message', self.on_message)
-            
+
             print("Pipeline setup complete")
         except Exception as e:
             print(f"Error setting up pipeline: {e}")
@@ -196,7 +215,7 @@ class GuitarTrainerApp(Gtk.Window):
         print(f"Pad added: {pad.get_name()}")
         pad_type = pad.query_caps(None).to_string()
         print(f"Pad type: {pad_type}")
-        
+
         if "video" in pad_type:
             pad.link(self.videosink.get_static_pad("sink"))
         elif "audio" in pad_type:
@@ -215,7 +234,8 @@ class GuitarTrainerApp(Gtk.Window):
         elif t == Gst.MessageType.STATE_CHANGED:
             if message.src == self.pipeline:
                 old_state, new_state, pending_state = message.parse_state_changed()
-                print(f"Pipeline state changed from {old_state.value_nick} to {new_state.value_nick}")
+                print(
+                    f"Pipeline state changed from {old_state.value_nick} to {new_state.value_nick}")
                 self.update_status(f"Player {new_state.value_nick}")
 
     def on_download_clicked(self, button):
@@ -223,11 +243,11 @@ class GuitarTrainerApp(Gtk.Window):
         if not url:
             self.update_status("Please enter a YouTube URL")
             return
-            
+
         print(f"Starting download of: {url}")
         self.update_status("Downloading video...")
         self.download_button.set_sensitive(False)
-        
+
         def download_video():
             try:
                 ydl_opts = {
@@ -236,7 +256,7 @@ class GuitarTrainerApp(Gtk.Window):
                     'quiet': True,
                     'no_warnings': True
                 }
-                
+
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
                     self.video_path = f"{info['title']}.mp4"
@@ -246,7 +266,7 @@ class GuitarTrainerApp(Gtk.Window):
                 print(f"Download error: {e}")
                 GLib.idle_add(self.update_status, f"Download failed: {str(e)}")
                 GLib.idle_add(self.download_button.set_sensitive, True)
-        
+
         threading.Thread(target=download_video, daemon=True).start()
 
     def on_download_complete(self):
@@ -257,15 +277,15 @@ class GuitarTrainerApp(Gtk.Window):
             uri = f"file://{os.path.abspath(self.video_path)}"
             print(f"Setting URI: {uri}")
             self.playbin.set_property("uri", uri)
-            
+
             # Set initial state to PAUSED to preroll the pipeline
             ret = self.pipeline.set_state(Gst.State.PAUSED)
             print(f"Pipeline state change result: {ret}")
-            
+
             # Wait for the state change to complete
             ret = self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
             print(f"Pipeline get_state result: {ret}")
-            
+
             # Initialize the first seek now, to ensure the speed is correctly set
             # This addresses the issue of video playback speed
             speed = self.speed_scale.get_value()
@@ -280,7 +300,7 @@ class GuitarTrainerApp(Gtk.Window):
                 -1  # we don't specify an end time
             )
             print(f"Initial seek result: {result}")
-            
+
             if ret[0] == Gst.StateChangeReturn.SUCCESS:
                 self.update_status("Video ready to play")
             else:
@@ -292,15 +312,15 @@ class GuitarTrainerApp(Gtk.Window):
         if self.playbin:
             self.pitch_buffer = None  # reset analysis buffer
             print("Play button clicked")
-            
+
             # Set to PLAYING state
             ret = self.pipeline.set_state(Gst.State.PLAYING)
             print(f"Play state change result: {ret}")
-            
+
             # Wait for the state change to complete
             ret = self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
             print(f"Pipeline get_state result after play: {ret}")
-            
+
             if ret[0] == Gst.StateChangeReturn.SUCCESS:
                 self.update_status("Playing")
             else:
@@ -310,11 +330,11 @@ class GuitarTrainerApp(Gtk.Window):
         if self.playbin:
             ret = self.pipeline.set_state(Gst.State.PAUSED)
             print(f"Pause state change result: {ret}")
-            
+
             # Wait for the state change to complete
             ret = self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
             print(f"Pipeline get_state result after pause: {ret}")
-            
+
             if ret[0] == Gst.StateChangeReturn.SUCCESS:
                 self.update_status("Paused")
             else:
@@ -328,7 +348,8 @@ class GuitarTrainerApp(Gtk.Window):
             if not success:
                 position = 0
 
-            print(f"Changing playback speed to {speed}. Current position: {position}")
+            print(
+                f"Changing playback speed to {speed}. Current position: {position}")
 
             # Build a seek event that only changes the playback rate while
             # continuing from the current position. We use FLUSH so the
@@ -427,13 +448,15 @@ class GuitarTrainerApp(Gtk.Window):
 
             note = self.freq_to_note_name(freq_smoothed)
             print(f"Detected pitch: {note} {freq_smoothed:.0f}Hz")
-            GLib.idle_add(self.pitch_label.set_text, f"{note} ({freq_smoothed:.0f} Hz)")
+            GLib.idle_add(self.pitch_label.set_text,
+                          f"{note} ({freq_smoothed:.0f} Hz)")
         finally:
             buf.unmap(mapinfo)
 
         return Gst.FlowReturn.OK
 
-    NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+    NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E',
+                  'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
     def freq_to_note_name(self, freq):
         if freq <= 0 or math.isnan(freq):
@@ -442,6 +465,7 @@ class GuitarTrainerApp(Gtk.Window):
         octave = note_num // 12 - 1
         name = self.NOTE_NAMES[note_num % 12]
         return f"{name}{octave}"
+
 
 if __name__ == '__main__':
     print("Starting main...")
