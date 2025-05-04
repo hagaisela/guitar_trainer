@@ -5,7 +5,8 @@ gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
 gi.require_version('Gst', '1.0')
 gi.require_version('GstVideo', '1.0')
-from gi.repository import Gtk, Gdk, GLib, Gst, GstVideo
+gi.require_version('GstApp', '1.0')
+from gi.repository import Gtk, Gdk, GLib, Gst, GstVideo, GstApp
 import traceback
 import math
 import sys
@@ -105,6 +106,13 @@ class GuitarTrainerApp(Gtk.Window):
         self.video_path = None
         self.pitch_buffer = None  # numpy array for accumulating audio samples
         self.recent_pitches = deque(maxlen=5)
+        # TAB-highlight state
+        self.tab_bbox = None        # (x, y, w, h) of tab area in video coords
+        self.tab_col = -1           # current column index
+        self.col_width = 80         # pixel width per TAB column (heuristic)
+        self.highlight_rects = []   # list[(x, y, w, h)] to draw each frame
+        self.tab_highlight = None   # overlay widget created later in setup_pipeline
+        self.onset_buffer = None    # numpy buffer for fallback onset detection
         print("GuitarTrainerApp initialization complete")
 
     def update_status(self, message):
@@ -137,13 +145,35 @@ class GuitarTrainerApp(Gtk.Window):
                     print("Could not set sync property on videosink")
                     pass  # some versions may not expose the property
 
-            # Build an audio sink bin with scaletempo for pitch-preserving time stretching
-            audio_sink_desc = (
+            # Build the audio sink description dynamically so the application
+            # still works on systems that do *not* have the aubioonset plugin
+            # installed.  We test once and only add the onset branch when the
+            # element is available.
+
+            has_aubioonset = Gst.ElementFactory.find("aubioonset") is not None
+
+            base_desc = (
                 "audioconvert ! audioresample ! scaletempo name=st ! tee name=split "
+                # ──── audible playback (keeps sync=true so speed changes are heard)
                 "split. ! queue max-size-time=0 max-size-buffers=0 ! audioconvert ! audioresample ! autoaudiosink sync=true "
+                # ──── pitch detector branch
                 "split. ! queue ! audioconvert ! audioresample ! capsfilter caps=audio/x-raw,format=F32LE,channels=1 ! "
-                "appsink name=pitchsink emit-signals=true sync=false max-buffers=5 drop=true"
+                "appsink name=pitchsink emit-signals=true sync=false max-buffers=5 drop=true "
             )
+
+            onset_desc = ""
+            if has_aubioonset:
+                onset_desc = "split. ! queue ! aubioonset name=onsetsink ! fakesink"
+            else:
+                # Fallback: create an appsink for Python-side onset detection
+                print("aubioonset element not found — using librosa onset detection fallback")
+                onset_desc = (
+                    "split. ! queue ! audioconvert ! audioresample ! "
+                    "capsfilter caps=audio/x-raw,format=F32LE,channels=1 ! "
+                    "appsink name=onsetsink emit-signals=true sync=false max-buffers=5 drop=true"
+                )
+
+            audio_sink_desc = base_desc + onset_desc
             self.audio_sink_bin = Gst.parse_bin_from_description(
                 audio_sink_desc, True)
 
@@ -151,6 +181,14 @@ class GuitarTrainerApp(Gtk.Window):
             self.pitchsink = self.audio_sink_bin.get_by_name("pitchsink")
             if self.pitchsink:
                 self.pitchsink.connect("new-sample", self.on_pitch_sample)
+
+            # Retrieve the aubioonset element for onset detection so we can
+            # identify its messages on the bus later.
+            self.onsetsink = self.audio_sink_bin.get_by_name("onsetsink")
+
+            # If the onsetsink is an appsink (fallback), connect signal handler
+            if self.onsetsink and isinstance(self.onsetsink, GstApp.AppSink):
+                self.onsetsink.connect("new-sample", self.on_onset_sample)
 
             # Retrieve the scaletempo element and make sure it's set up correctly
             self.scaletempo = self.audio_sink_bin.get_by_name("st")
@@ -189,6 +227,15 @@ class GuitarTrainerApp(Gtk.Window):
                 self.pitch_label.override_color(
                     Gtk.StateFlags.NORMAL, Gdk.RGBA(1, 1, 0, 1))
                 overlay.add_overlay(self.pitch_label)
+
+                # --- Overlay for TAB highlighting ---
+                self.tab_highlight = Gtk.DrawingArea()
+                self.tab_highlight.set_halign(Gtk.Align.FILL)
+                self.tab_highlight.set_valign(Gtk.Align.FILL)
+                self.tab_highlight.set_hexpand(True)
+                self.tab_highlight.set_vexpand(True)
+                self.tab_highlight.connect("draw", self.on_tab_highlight_draw)
+                overlay.add_overlay(self.tab_highlight)
 
                 self.video_area.pack_start(overlay, True, True, 0)
                 sink_widget.show()
@@ -237,6 +284,13 @@ class GuitarTrainerApp(Gtk.Window):
                 print(
                     f"Pipeline state changed from {old_state.value_nick} to {new_state.value_nick}")
                 self.update_status(f"Player {new_state.value_nick}")
+        elif t == Gst.MessageType.TAG:
+            # aubioonset posts TAG messages with an "onset" tag each time it
+            # detects a new attack.  We advance the TAB cursor (or simply log
+            # for now) when we receive one.
+            if message.src == getattr(self, "onsetsink", None):
+                # Any TAG message from onsetsink corresponds to an onset.
+                GLib.idle_add(self.on_onset_detected)
 
     def on_download_clicked(self, button):
         url = self.url_entry.get_text()
@@ -465,6 +519,133 @@ class GuitarTrainerApp(Gtk.Window):
         octave = note_num // 12 - 1
         name = self.NOTE_NAMES[note_num % 12]
         return f"{name}{octave}"
+
+    def on_onset_detected(self):
+        """Callback executed in the GTK main thread when aubioonset signals a new onset.
+
+        At this stage we only print and keep a placeholder for future TAB
+        column-advance logic.
+        """
+        print("Onset detected (aubioonset)")
+
+        # Ensure the highlight overlay exists
+        if not self.tab_highlight:
+            return
+
+        alloc = self.tab_highlight.get_allocation()
+        width, height = alloc.width, alloc.height
+
+        # Lazily determine the TAB bounding box (bottom 35 % of frame)
+        if self.tab_bbox is None and width > 0 and height > 0:
+            bbox_y = int(height * 0.65)
+            bbox_h = int(height * 0.30)
+            self.tab_bbox = (0, bbox_y, width, bbox_h)
+
+        if self.tab_bbox is None:
+            return
+
+        # Advance column index and wrap when exceeding width
+        bbox_x, bbox_y, bbox_w, bbox_h = self.tab_bbox
+        self.tab_col = (self.tab_col + 1) % max(1, bbox_w // self.col_width)
+
+        x = bbox_x + self.tab_col * self.col_width
+        self.highlight_rects = [(x, bbox_y, self.col_width, bbox_h)]
+
+        print(f"tab_highlight allocation: {width}x{height}")
+        print(f"Highlight rects set to: {self.highlight_rects}")
+
+        self.tab_highlight.queue_draw()
+
+    # ---------------------------------------------------------------------
+    # Gtk.DrawingArea draw callback for TAB highlight overlay
+    # ---------------------------------------------------------------------
+    def on_tab_highlight_draw(self, widget, cr):
+        """Draw translucent rectangles over the current TAB column.
+
+        This method is connected to the `draw` signal of `self.tab_highlight`.
+        It iterates through `self.highlight_rects` and fills each rectangle
+        with a semi-transparent colour.
+        """
+        if not self.highlight_rects:
+            # Debug: nothing to draw
+            print("on_tab_highlight_draw: no rects")
+            return False
+
+        print(f"on_tab_highlight_draw: drawing {len(self.highlight_rects)} rects")
+
+        cr.set_source_rgba(1.0, 0.8, 0.0, 0.35)  # yellow-orange, α=0.35
+        for x, y, w, h in self.highlight_rects:
+            cr.rectangle(x, y, w, h)
+            cr.fill()
+
+        # return False to propagate further drawing if needed
+        return False
+
+    # ------------------------------------------------------------------
+    # Fallback Python-side onset detection when aubioonset is unavailable
+    # ------------------------------------------------------------------
+    def on_onset_sample(self, appsink):
+        """Signal handler for appsink-based onset detection fallback."""
+        global np, librosa
+        if np is None:
+            try:
+                import numpy as np
+            except Exception as e:
+                print("numpy import failed (onset):", e)
+                return Gst.FlowReturn.OK
+        if librosa is None:
+            try:
+                import librosa
+            except Exception as e:
+                print("librosa import failed (onset):", e)
+                return Gst.FlowReturn.OK
+
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+
+        buf = sample.get_buffer()
+        caps = sample.get_caps()
+        rate = caps.get_structure(0).get_value("rate")
+
+        success, mapinfo = buf.map(Gst.MapFlags.READ)
+        if not success:
+            return Gst.FlowReturn.ERROR
+
+        try:
+            block = np.frombuffer(mapinfo.data, dtype=np.float32)
+        finally:
+            buf.unmap(mapinfo)
+
+        # Accumulate ~0.1 s of audio before running onset detector
+        if self.onset_buffer is None:
+            self.onset_buffer = block.copy()
+        else:
+            self.onset_buffer = np.concatenate((self.onset_buffer, block))
+
+        # Require at least 4096 samples (~93 ms @ 44.1 kHz)
+        MIN_SAMPLES = 4096
+        if len(self.onset_buffer) < MIN_SAMPLES:
+            return Gst.FlowReturn.OK
+
+        # Run onset detection on the accumulated buffer
+        try:
+            onsets = librosa.onset.onset_detect(y=self.onset_buffer, sr=rate, units="samples", backtrack=False)
+        except Exception as e:
+            print("librosa onset_detect error:", e)
+            onsets = []
+
+        if len(onsets) > 0:
+            # Call UI update in main thread
+            GLib.idle_add(self.on_onset_detected)
+            # Keep residual samples after last onset to continue detection
+            last_onset_sample = int(onsets[-1])
+            self.onset_buffer = self.onset_buffer[last_onset_sample:]
+        else:
+            # To prevent the buffer from growing unbounded, keep last slice
+            self.onset_buffer = self.onset_buffer[-MIN_SAMPLES:]
+
+        return Gst.FlowReturn.OK
 
 
 if __name__ == '__main__':
