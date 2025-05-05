@@ -768,6 +768,23 @@ class GuitarTrainerApp(Gtk.Window):
                 return True  # keep polling until non-black
 
             cv2.imwrite("debug_frame.png", frame_bgr)
+
+            # Attempt to locate TAB area
+            bbox = self.detect_tab_bbox(frame_bgr)
+            if bbox:
+                print(f"[DEBUG] TAB bbox detected: {bbox}")
+                self.tab_bbox = bbox
+                # Draw a rectangle in debug image for visual verification
+                dbg = frame_bgr.copy()
+                x, y, w_box, h_box = bbox
+                cv2.rectangle(dbg, (x, y), (x + w_box, y + h_box), (0, 255, 0), 2)
+                cv2.imwrite("tab_detect.png", dbg)
+
+                # Update highlight overlay in GTK thread
+                if self.tab_highlight:
+                    self.highlight_rects = [bbox]
+                    GLib.idle_add(self.tab_highlight.queue_draw)
+
             print(f"[DEBUG] First frame captured ({w}x{h_real}, bpp={bpp}) -> debug_frame.png")
             self.frame_captured = True
             self.update_status("Captured frame for TAB detection")
@@ -775,6 +792,141 @@ class GuitarTrainerApp(Gtk.Window):
             buf.unmap(mapinfo)
 
         return False  # stop polling once captured
+
+    # --------------------------------------------------------------
+    # Detect TAB bounding box (group of 6 horizontal lines) in frame
+    # --------------------------------------------------------------
+    def detect_tab_bbox(self, img_bgr):
+        """Return (x, y, w, h) bounding box of guitar TAB if found, else None."""
+        if cv2 is None or np is None:
+            return None
+
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+
+        roi_y0 = int(h * 0.45)
+        roi = gray[roi_y0:, :]
+
+        # Crop away black side bars by checking column brightness
+        col_sum = np.mean(roi, axis=0)
+        non_dark = np.where(col_sum > 10)[0]  # columns with some brightness
+        if len(non_dark) < w * 0.3:  # screen mostly black? give up
+            print("[DEBUG] ROI mostly dark") 
+            return None
+
+        x_left, x_right = non_dark[0], non_dark[-1]
+        roi = roi[:, x_left:x_right]
+        w_cropped = x_right - x_left
+
+        # Adaptive threshold → binary with lines in white
+        bin_img = cv2.adaptiveThreshold(roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                        cv2.THRESH_BINARY_INV, 15, 9)
+
+        # Morphological opening to keep only horizontal lines
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+        lines_only = cv2.morphologyEx(bin_img, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        # Row-wise projection
+        proj = np.sum(lines_only, axis=1)
+        if proj.max() == 0:
+            print("[DEBUG] Projection all zeros – no lines")
+            return None
+
+        thresh = 0.3 * proj.max()
+        peak_rows = np.where(proj >= thresh)[0]
+
+        if len(peak_rows) < 6:
+            print(f"[DEBUG] Only {len(peak_rows)} peak rows; need >=6")
+            return None
+
+        # Cluster consecutive rows into individual line centers
+        clusters = []
+        current = [peak_rows[0]]
+        for r in peak_rows[1:]:
+            if r - current[-1] <= 2:
+                current.append(r)
+            else:
+                clusters.append(current)
+                current = [r]
+        clusters.append(current)
+
+        centers = [int(np.mean(c)) for c in clusters]
+        centers.sort()
+
+        # Find any 6-line subset with roughly equal spacing (±3 px)
+        best_group = None
+        best_score = 9999
+        for i in range(len(centers) - 5):
+            group = centers[i:i + 6]
+            spacings = np.diff(group)
+            if spacings.min() == 0:
+                continue
+            if np.max(spacings) - np.min(spacings) <= 3:
+                score = np.std(spacings)
+                if score < best_score:
+                    best_score = score
+                    best_group = group
+
+        if best_group is None:
+            print("[DEBUG] No 6-line uniform group from projection; falling back to Hough")
+            # ‑-- Fallback: call previous Hough-based method for robustness
+            return self.detect_tab_bbox_hough(img_bgr)
+
+        mean_sp = int(np.mean(np.diff(best_group)))
+        y_top = best_group[0] - mean_sp // 2 + roi_y0
+        y_bot = best_group[-1] + mean_sp // 2 + roi_y0
+        bbox_h = y_bot - y_top
+        bbox_x = x_left
+        return (bbox_x, max(y_top, 0), w_cropped, bbox_h)
+
+    # ------------------------------------------------------------------
+    # Previous Hough-based detector kept for fallback / debugging
+    # ------------------------------------------------------------------
+    def detect_tab_bbox_hough(self, img_bgr):
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        h, w = gray.shape
+        roi_y0 = int(h * 0.45)
+        roi = gray[roi_y0:, :]
+        roi_blur = cv2.GaussianBlur(roi, (3, 3), 0)
+        edges = cv2.Canny(roi_blur, 50, 120)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60,
+                                minLineLength=int(w * 0.4), maxLineGap=30)
+        if lines is None:
+            print("[DEBUG] Hough fallback also found no lines")
+            return None
+
+        ys = []
+        for l in lines:
+            x1, y1, x2, y2 = l[0]
+            if abs(y1 - y2) <= 4:
+                ys.append(y1)
+        if len(ys) < 6:
+            print(f"[DEBUG] Hough fallback found {len(ys)} lines < 6")
+            return None
+
+        ys = np.array(sorted(ys))
+        clusters = []
+        current = [ys[0]]
+        for y in ys[1:]:
+            if y - current[-1] <= 6:
+                current.append(y)
+            else:
+                clusters.append(current)
+                current = [y]
+        clusters.append(current)
+        centers = [int(np.mean(c)) for c in clusters]
+        centers.sort()
+        for i in range(len(centers) - 5):
+            group = centers[i:i + 6]
+            spacings = np.diff(group)
+            if np.max(spacings) - np.min(spacings) <= 4:
+                mean_sp = int(np.mean(spacings))
+                y_top = group[0] - mean_sp // 2 + roi_y0
+                y_bot = group[-1] + mean_sp // 2 + roi_y0
+                return (0, y_top, w, y_bot - y_top)
+        print("[DEBUG] Hough fallback no uniform 6-line group")
+        return None
 
 
 if __name__ == '__main__':
