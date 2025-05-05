@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# pylint: disable=import-error
 import os
 import gi
 # Specify versions before importing gi modules
@@ -27,6 +29,13 @@ except Exception as e:
     traceback.print_exc()
     librosa = None
 
+# Optional OpenCV (used for frame capture). Fallback to None if unavailable.
+try:
+    import cv2  # type: ignore  # pylint: disable=import-error
+except Exception as e:
+    print("cv2 import failed:", e)
+    cv2 = None
+
 print("Starting application...")
 
 
@@ -36,6 +45,13 @@ class GuitarTrainerApp(Gtk.Window):
         super().__init__()
         self.set_title("Guitar Tutorial Player")
         self.set_default_size(800, 600)
+
+        # Cleanup previous debug frame capture if present
+        try:
+            if os.path.exists("debug_frame.png"):
+                os.remove("debug_frame.png")
+        except OSError:
+            pass
 
         # Initialize GStreamer
         print("Initializing GStreamer...")
@@ -113,6 +129,16 @@ class GuitarTrainerApp(Gtk.Window):
         self.highlight_rects = []   # list[(x, y, w, h)] to draw each frame
         self.tab_highlight = None   # overlay widget created later in setup_pipeline
         self.onset_buffer = None    # numpy buffer for fallback onset detection
+        self.frame_captured = False  # Flag to track first-frame capture
+
+        # Auto-load first video file in current directory (mp4/avi/mkv/mov)
+        for fname in os.listdir('.'):
+            if fname.lower().endswith(('.mp4', '.avi', '.mkv', '.mov')):
+                self.video_path = fname
+                print(f"Found local video file: {self.video_path}")
+                GLib.idle_add(self.load_local_video)
+                break
+
         print("GuitarTrainerApp initialization complete")
 
     def update_status(self, message):
@@ -377,6 +403,10 @@ class GuitarTrainerApp(Gtk.Window):
 
             if ret[0] == Gst.StateChangeReturn.SUCCESS:
                 self.update_status("Playing")
+
+                # Start trying to capture a non-black frame (once per 0.4 s)
+                if not self.frame_captured:
+                    GLib.timeout_add(400, self._capture_first_frame)
             else:
                 self.update_status("Failed to play video")
 
@@ -646,6 +676,105 @@ class GuitarTrainerApp(Gtk.Window):
             self.onset_buffer = self.onset_buffer[-MIN_SAMPLES:]
 
         return Gst.FlowReturn.OK
+
+    # --------------------------------------------------------------
+    # Load a local video discovered at startup
+    # --------------------------------------------------------------
+    def load_local_video(self):
+        if not self.video_path:
+            return
+
+        self.update_status("Preparing local video…")
+
+        # Build pipeline and set URI
+        self.setup_pipeline()
+
+        uri = f"file://{os.path.abspath(self.video_path)}"
+        print(f"Setting URI for local video: {uri}")
+        self.playbin.set_property("uri", uri)
+
+        # Preroll (PAUSED) so first frame is available
+        self.pipeline.set_state(Gst.State.PAUSED)
+        self.update_status("Local video ready – press Play")
+
+    # --------------------------------------------------------------
+    # Poll videosink.last-sample until we capture a bright frame
+    # --------------------------------------------------------------
+    def _capture_first_frame(self):
+        global cv2, np  # pylint: disable=undefined-variable
+
+        # Lazy import cv2 / numpy if they were not available at startup
+        if cv2 is None:
+            try:
+                import cv2 as _cv2  # type: ignore  # pylint: disable=import-error
+                globals()['cv2'] = _cv2
+            except Exception as e:
+                print('[DEBUG] cv2 import failed in capture:', e)
+                return True  # keep trying (maybe package loads later)
+
+        if np is None:
+            try:
+                import numpy as _np  # type: ignore
+                globals()['np'] = _np
+            except Exception as e:
+                print('[DEBUG] numpy import failed in capture:', e)
+                return False
+
+        if self.frame_captured or self.videosink is None:
+            return False  # stop timer
+
+        sample = self.videosink.get_property("last-sample")
+        if not sample:
+            return True  # try again later
+
+        buf = sample.get_buffer()
+        caps = sample.get_caps()
+        w = caps.get_structure(0).get_value("width")
+        h_caps = caps.get_structure(0).get_value("height")
+
+        ok, mapinfo = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return False
+
+        try:
+            # Infer bytes-per-pixel from buffer size.  This handles RGB, BGRx, etc.
+            buf_size = len(mapinfo.data)
+            if w == 0:
+                return False  # invalid caps
+
+            bpp = buf_size // (w * h_caps) if h_caps > 0 else 0
+
+            if bpp not in (3, 4):
+                print(f"[DEBUG] Unsupported bytes-per-pixel ({bpp}), skipping frame capture")
+                return False
+
+            # Some sinks misreport height in caps (e.g. 360 vs actual 480).
+            # Re-compute real height from buffer size.
+            h_real = buf_size // (w * bpp)
+
+            if h_real * w * bpp != buf_size:
+                print("[DEBUG] Buffer size does not align with inferred geometry, skipping")
+                return False
+
+            frame = np.frombuffer(mapinfo.data, dtype=np.uint8).reshape((h_real, w, bpp))
+
+            # Convert to 3-channel BGR for saving if necessary
+            if bpp == 4:
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            else:  # bpp == 3, assume BGR already (gtksink outputs BGR)
+                frame_bgr = frame
+
+            if frame_bgr.mean() < 5:
+                return True  # keep polling until non-black
+
+            cv2.imwrite("debug_frame.png", frame_bgr)
+            print(f"[DEBUG] First frame captured ({w}x{h_real}, bpp={bpp}) -> debug_frame.png")
+            self.frame_captured = True
+            self.update_status("Captured frame for TAB detection")
+        finally:
+            buf.unmap(mapinfo)
+
+        return False  # stop polling once captured
 
 
 if __name__ == '__main__':
