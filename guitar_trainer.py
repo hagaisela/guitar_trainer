@@ -254,14 +254,7 @@ class GuitarTrainerApp(Gtk.Window):
                     Gtk.StateFlags.NORMAL, Gdk.RGBA(1, 1, 0, 1))
                 overlay.add_overlay(self.pitch_label)
 
-                # --- Overlay for TAB highlighting ---
-                self.tab_highlight = Gtk.DrawingArea()
-                self.tab_highlight.set_halign(Gtk.Align.FILL)
-                self.tab_highlight.set_valign(Gtk.Align.FILL)
-                self.tab_highlight.set_hexpand(True)
-                self.tab_highlight.set_vexpand(True)
-                self.tab_highlight.connect("draw", self.on_tab_highlight_draw)
-                overlay.add_overlay(self.tab_highlight)
+                # TAB highlighting overlay disabled (removed)
 
                 self.video_area.pack_start(overlay, True, True, 0)
                 sink_widget.show()
@@ -873,11 +866,22 @@ class GuitarTrainerApp(Gtk.Window):
             return self.detect_tab_bbox_hough(img_bgr)
 
         mean_sp = int(np.mean(np.diff(best_group)))
-        y_top = best_group[0] - mean_sp // 2 + roi_y0
-        y_bot = best_group[-1] + mean_sp // 2 + roi_y0
+        # Use a full string spacing as padding above the top line and below the
+        # bottom line so that the numbers that usually sit slightly outside the
+        # six staff lines are fully captured.  A half-spacing (previous logic)
+        # was cropping them off.
+        padding = mean_sp  # one string spacing
+
+        y_top = best_group[0] - padding + roi_y0
+        y_bot = best_group[-1] + padding + roi_y0
+
+        # Clamp to image bounds
+        y_top = max(y_top, 0)
+        y_bot = min(y_bot, h)
+
         bbox_h = y_bot - y_top
         bbox_x = x_left
-        return (bbox_x, max(y_top, 0), w_cropped, bbox_h)
+        return (bbox_x, y_top, w_cropped, bbox_h)
 
     # ------------------------------------------------------------------
     # Previous Hough-based detector kept for fallback / debugging
@@ -922,8 +926,18 @@ class GuitarTrainerApp(Gtk.Window):
             spacings = np.diff(group)
             if np.max(spacings) - np.min(spacings) <= 4:
                 mean_sp = int(np.mean(spacings))
-                y_top = group[0] - mean_sp // 2 + roi_y0
-                y_bot = group[-1] + mean_sp // 2 + roi_y0
+
+                # Apply full string spacing padding to include digits outside
+                # the six lines.  This prevents cropping of numbers above or
+                # below the TAB staff.
+                padding = mean_sp  # one string spacing
+
+                y_top = group[0] - padding + roi_y0
+                y_bot = group[-1] + padding + roi_y0
+
+                y_top = max(y_top, 0)
+                y_bot = min(y_bot, h)
+
                 return (0, y_top, w, y_bot - y_top)
         print("[DEBUG] Hough fallback no uniform 6-line group")
         return None
