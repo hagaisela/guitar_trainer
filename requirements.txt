@@ -1,2 +1,6 @@
 PyGObject>=3.42.0
-yt-dlp>=2024.3.10 
+yt-dlp>=2024.3.10
+tensorflow-cpu>=2.15.0
+pillow>=9.5.0
+numpy>=1.23
+fonttools>=4.50 
