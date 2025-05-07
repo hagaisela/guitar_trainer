@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 # pylint: disable=import-error,unused-import
 """train_tab_digit_model.py
 
@@ -81,10 +82,9 @@ def _generate_sample(label: int, fonts: List[ImageFont.FreeTypeFont]) -> Tuple[n
     img = Image.new("L", (IMG_SIZE, IMG_SIZE), color=255)
     draw = ImageDraw.Draw(img)
 
-    # Random font / size
+    # Random font / size (broader range 10-34 px)
     font = random.choice(fonts)
-    size_variation = random.uniform(0.8, 1.2)
-    font_size = int(32 * size_variation)
+    font_size = random.randint(10, 34)
     font = ImageFont.truetype(font.path if hasattr(font, "path") else font.font.family, font_size)
 
     # Measure text size (Pillow ≥10 dropped textsize; use textbbox if available)
@@ -122,9 +122,17 @@ def _generate_sample(label: int, fonts: List[ImageFont.FreeTypeFont]) -> Tuple[n
         angle = random.uniform(-8, 8)
         img = img.rotate(angle, resample=Image.BILINEAR, expand=False, fillcolor=255)
 
-    # Add gaussian blur / noise
+    # Add gaussian blur / noise (simulate video compression)
+    if random.random() < 0.5:
+        img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.3, 1.0)))
+
+    # Downscale & upsample to introduce anti-aliasing artefacts (30 % chance)
     if random.random() < 0.3:
-        img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.3, 0.8)))
+        factor = random.uniform(0.5, 0.8)
+        new_w = max(1, int(IMG_SIZE * factor))
+        new_h = max(1, int(IMG_SIZE * factor))
+        img_small = img.resize((new_w, new_h), Image.LANCZOS)
+        img = img_small.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
 
     arr = np.asarray(img, dtype=np.float32) / 255.0  # normalise 0-1
     arr = 1.0 - arr  # invert: digits white on black (improves contrast)
