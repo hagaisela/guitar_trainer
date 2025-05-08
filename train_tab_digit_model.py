@@ -42,6 +42,10 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from tensorflow import keras
 from tensorflow.keras import layers
+import tensorflow as tf
+
+SEED = 1234
+random.seed(SEED); np.random.seed(SEED); tf.random.set_seed(SEED)
 
 # -----------------------------------------------------------------------------
 # Synthetic image generator
@@ -121,6 +125,14 @@ def _generate_sample(label: int, fonts: List[ImageFont.FreeTypeFont]) -> Tuple[n
     if random.random() < 0.5:
         angle = random.uniform(-8, 8)
         img = img.rotate(angle, resample=Image.BILINEAR, expand=False, fillcolor=255)
+
+    # Randomly ERODE               (thin stroke)  or DILATE (thick stroke)
+    rnd = random.random()
+    if rnd < 0.4:
+        img = img.filter(ImageFilter.MinFilter(3))          # erode 40 %
+    elif rnd < 0.7:
+        img = img.filter(ImageFilter.MaxFilter(3))          # dilate 30 %
+    # remaining 30 % keep original stroke
 
     # Add gaussian blur / noise (simulate video compression)
     if random.random() < 0.5:
@@ -212,7 +224,7 @@ def main():  # noqa: C901
 
     callbacks = [
         keras.callbacks.ModelCheckpoint(str(out_dir / "best.h5"), monitor="val_accuracy", save_best_only=True),
-        keras.callbacks.ReduceLROnPlateau(monitor="val_accuracy", factor=0.5, patience=3),
+        keras.callbacks.ReduceLROnPlateau(monitor="val_accuracy", factor=0.2, patience=3, min_lr=1e-5),
     ]
 
     model.fit(
@@ -231,8 +243,6 @@ def main():  # noqa: C901
     # Export TensorFlow-Lite quantised model for fast CPU inference
     # ---------------------------------------------------------------------
     try:
-        import tensorflow as tf  # noqa: WPS433
-
         converter = tf.lite.TFLiteConverter.from_keras_model(model)
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
         converter.target_spec.supported_types = [tf.float16]
