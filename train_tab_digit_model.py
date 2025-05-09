@@ -86,9 +86,9 @@ def _generate_sample(label: int, fonts: List[ImageFont.FreeTypeFont]) -> Tuple[n
     img = Image.new("L", (IMG_SIZE, IMG_SIZE), color=255)
     draw = ImageDraw.Draw(img)
 
-    # Random font / size (broader range 10-34 px)
+    # Random font / size  (video digits are ~26-38 px on a 40-px crop)
     font = random.choice(fonts)
-    font_size = random.randint(10, 34)
+    font_size = random.randint(24, 44)
     font = ImageFont.truetype(font.path if hasattr(font, "path") else font.font.family, font_size)
 
     # Measure text size (Pillow ≥10 dropped textsize; use textbbox if available)
@@ -106,7 +106,10 @@ def _generate_sample(label: int, fonts: List[ImageFont.FreeTypeFont]) -> Tuple[n
 
     # Random text colour (black / very dark grey)
     colour = random.randint(0, 50)
-    draw.text((x, y), text, fill=colour, font=font)
+    # Draw with an outline so thin fonts become bold → closer to Guitar-Pro export
+    stroke_w = random.choice([1, 2])
+    draw.text((x, y), text, fill=colour, font=font,
+              stroke_width=stroke_w, stroke_fill=colour)
 
     # Optionally draw TAB staff lines (6 horizontal lines)
     if random.random() < 0.7:
@@ -126,17 +129,13 @@ def _generate_sample(label: int, fonts: List[ImageFont.FreeTypeFont]) -> Tuple[n
         angle = random.uniform(-8, 8)
         img = img.rotate(angle, resample=Image.BILINEAR, expand=False, fillcolor=255)
 
-    # Randomly ERODE               (thin stroke)  or DILATE (thick stroke)
+    # Random morphological noise – favour **thickening**
     rnd = random.random()
-    if rnd < 0.4:
-        img = img.filter(ImageFilter.MinFilter(3))          # erode 40 %
-    elif rnd < 0.7:
-        img = img.filter(ImageFilter.MaxFilter(3))          # dilate 30 %
-    # remaining 30 % keep original stroke
-
-    # Add gaussian blur / noise (simulate video compression)
-    if random.random() < 0.5:
-        img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.3, 1.0)))
+    if rnd < 0.15:
+        img = img.filter(ImageFilter.MinFilter(3))          # 15 % thinner
+    elif rnd < 0.65:
+        img = img.filter(ImageFilter.MaxFilter(3))          # 50 % thicker
+    # remaining 30 % stay unchanged
 
     # Downscale & upsample to introduce anti-aliasing artefacts (30 % chance)
     if random.random() < 0.3:
@@ -208,6 +207,7 @@ def main():  # noqa: C901
     parser.add_argument("--val-steps", type=int, default=100)
     parser.add_argument("--out", type=str, default=".", help="output directory")
     parser.add_argument("--font", action="append", type=str, help="additional .ttf font file to include")
+    parser.add_argument("--preview", action="store_true", help="generate 25 sample images then exit")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -215,6 +215,22 @@ def main():  # noqa: C901
 
     fonts = _load_fonts([Path(f) for f in args.font] if args.font else None)
     print(f"Loaded {len(fonts)} fonts for augmentation")
+
+    # -----------------------------------------------------------------
+    # Preview mode: save a handful of random samples and exit early
+    # -----------------------------------------------------------------
+    if args.preview:
+        preview_dir = out_dir / "preview"
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(25):
+            label = random.randint(0, 24)
+            arr, lbl = _generate_sample(label, fonts)
+            # Convert back to PIL.Image for saving (invert again so digits dark)
+            img = (1.0 - arr[:, :, 0]) * 255.0
+            img_pil = Image.fromarray(img.astype(np.uint8), mode="L")
+            img_pil.save(preview_dir / f"sample_{i:02d}_lbl{lbl}.png")
+        print(f"Preview images written to {preview_dir} → exiting")
+        return
 
     train_gen = TabDigitSequence(args.batch_size, args.steps_per_epoch, fonts)
     val_gen = TabDigitSequence(args.batch_size, args.val_steps, fonts)

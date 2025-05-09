@@ -36,6 +36,12 @@ except Exception as e:
     print("cv2 import failed:", e)
     cv2 = None
 
+try:
+    from tensorflow.keras.models import load_model  # type: ignore  # pylint: disable=import-error
+except Exception as e:
+    print("TensorFlow/Keras import failed:", e)
+    load_model = None
+
 print("Starting application...")
 
 
@@ -130,6 +136,10 @@ class GuitarTrainerApp(Gtk.Window):
         self.tab_highlight = None   # overlay widget created later in setup_pipeline
         self.onset_buffer = None    # numpy buffer for fallback onset detection
         self.frame_captured = False  # Flag to track first-frame capture
+        # ------------------------------------------------------------------
+        # Digit-recognition CNN (trained via train_tab_digit_model.py)
+        # ------------------------------------------------------------------
+        self.digit_model = self._load_digit_model()
 
         # Auto-load first video file in current directory (mp4/avi/mkv/mov)
         for fname in os.listdir('.'):
@@ -273,6 +283,15 @@ class GuitarTrainerApp(Gtk.Window):
             bus.connect('message', self.on_message)
 
             print("Pipeline setup complete")
+
+            # Ask the sink for the negotiated video size and resize the window
+            caps = self.videosink.get_static_pad("sink").get_current_caps()
+            if caps:
+                w = caps.get_structure(0).get_value("width")
+                h = caps.get_structure(0).get_value("height")
+                if w and h:
+                    # grow the window to the video size (+ UI chrome margins)
+                    GLib.idle_add(self.resize, w, h + 140)
         except Exception as e:
             print(f"Error setting up pipeline: {e}")
             self.update_status(f"Error setting up video player: {str(e)}")
@@ -324,7 +343,10 @@ class GuitarTrainerApp(Gtk.Window):
         def download_video():
             try:
                 ydl_opts = {
-                    'format': 'best[ext=mp4]',
+                    # Fetch highest-resolution video + best audio, then merge into MP4.
+                    # This avoids the 720 p cap of progressive MP4 and keeps TAB digits sharp.
+                    'format': 'bestvideo+bestaudio/best',
+                    'merge_output_format': 'mp4',
                     'outtmpl': '%(title)s.%(ext)s',
                     'quiet': True,
                     'no_warnings': True
@@ -773,6 +795,10 @@ class GuitarTrainerApp(Gtk.Window):
                 cv2.rectangle(dbg, (x, y), (x + w_box, y + h_box), (0, 255, 0), 2)
                 cv2.imwrite("tab_detect.png", dbg)
 
+                # Optionally detect and annotate digits within TAB area
+                if self.digit_model is not None:
+                    self.detect_tab_digits(frame_bgr, bbox)
+
                 # Update highlight overlay in GTK thread
                 if self.tab_highlight:
                     self.highlight_rects = [bbox]
@@ -941,6 +967,144 @@ class GuitarTrainerApp(Gtk.Window):
                 return (0, y_top, w, y_bot - y_top)
         print("[DEBUG] Hough fallback no uniform 6-line group")
         return None
+
+    # ------------------------------------------------------------------
+    # New: digit recognition within detected TAB bbox
+    # ------------------------------------------------------------------
+    def _load_digit_model(self):
+        """Attempt to load the CNN trained by train_tab_digit_model.py.
+
+        Searches a few common locations and returns the loaded Keras model or
+        None if loading failed / TensorFlow unavailable.
+        """
+        if load_model is None:
+            return None
+
+        candidate_paths = [
+            "tab_digit_cnn.h5",
+            os.path.join("models", "tab_digit_cnn.h5"),
+            "best.h5",
+            os.path.join("models", "best.h5"),
+        ]
+        for path in candidate_paths:
+            if os.path.exists(path):
+                try:
+                    print(f"Loading TAB-digit CNN from {path}…")
+                    model = load_model(path, compile=False)
+                    return model
+                except Exception as exc:  # pragma: no cover
+                    print("[WARN] Failed to load", path, str(exc))
+        print("[WARN] No TAB-digit model found — digit detection disabled")
+        return None
+
+    def _prep_digit_crop(self, crop_gray_inv):  # -> np.ndarray shape (1,40,40,1)
+        """Return crop resized/padded to 40×40 with pixel range [0,1]."""
+        import numpy as _np  # local import to avoid top-level requirement
+        h_c, w_c = crop_gray_inv.shape
+        size = max(h_c, w_c)
+        padded = _np.zeros((size, size), dtype=_np.uint8)
+        y_off = (size - h_c) // 2
+        x_off = (size - w_c) // 2
+        padded[y_off:y_off + h_c, x_off:x_off + w_c] = crop_gray_inv
+
+        # Thicken strokes a bit (matches MaxFilter augmentation during training)
+        padded = cv2.dilate(padded, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+
+        resized = cv2.resize(padded, (40, 40), interpolation=cv2.INTER_NEAREST)
+
+        # Normalise → 0-1 and invert so digits are bright (1) on black (0),
+        # exactly like the training generator (arr = 1-arr)
+        arr = resized.astype(_np.float32) / 255.0  # keep digits white (1) on black (0)
+        arr = 1.0 - arr
+        arr = _np.expand_dims(arr, axis=-1)  # HWC→HWC1
+        arr = _np.expand_dims(arr, axis=0)   # batch dim
+        return arr
+
+    def detect_tab_digits(self, img_bgr, bbox):
+        """Detect and annotate fret numbers inside *bbox* of *img_bgr*.
+
+        Saves an image with green rectangles and predicted digits to
+        'tab_boxes.png'.  Requires self.digit_model to be initialised.
+        """
+        if self.digit_model is None or cv2 is None or np is None:
+            return
+
+        x0, y0, w_box, h_box = bbox
+        roi_bgr = img_bgr[y0:y0 + h_box, x0:x0 + w_box]
+        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+
+        # Binary inverse threshold so digits are white (255) on black (0)
+        _, thresh_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        # Remove thin horizontal staff lines via morphological opening
+        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 1))
+        lines_removed = cv2.morphologyEx(thresh_inv, cv2.MORPH_OPEN, horiz_kernel, iterations=1)
+        digits_mask = cv2.bitwise_xor(thresh_inv, lines_removed)
+
+        # --------------------------------------------------------------
+        # Cluster contours that belong to the *same column* (multi-digit)
+        # --------------------------------------------------------------
+        boxes = []
+        contours, _ = cv2.findContours(digits_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            if h < 8 or w < 4:
+                continue
+            if h > h_box * 0.9:
+                continue
+            boxes.append([x, y, w, h])
+
+        # Sort left-to-right
+        boxes.sort(key=lambda b: b[0])
+
+        merged = []  # list of [x0,y0,x1,y1]
+        for b in boxes:
+            x0, y0, w, h = b
+            x1, y1 = x0 + w, y0 + h
+            if not merged:
+                merged.append([x0, y0, x1, y1])
+                continue
+            prev = merged[-1]
+            # If this box starts very close (≤5 px) to previous right edge → same number
+            if x0 - prev[2] <= 5:  # horizontal gap ≤5 px
+                # expand previous
+                prev[2] = max(prev[2], x1)
+                prev[1] = min(prev[1], y0)
+                prev[3] = max(prev[3], y1)
+            else:
+                merged.append([x0, y0, x1, y1])
+
+        annotated = roi_bgr.copy()
+
+        for i, (x0, y0, x1, y1) in enumerate(merged):
+            crop = digits_mask[y0:y1, x0:x1]
+            if crop.size == 0:
+                continue
+            inp = self._prep_digit_crop(crop)
+            cv2.imwrite(f"debug_crop_{i}.png",
+                        (inp[0, :, :, 0] * 255).astype(np.uint8))
+            try:
+                pred = self.digit_model.predict(inp, verbose=0)
+                label = int(np.argmax(pred))
+                conf = float(np.max(pred))
+            except Exception as exc:
+                print("[WARN] digit prediction failed:", exc)
+                continue
+
+            cv2.rectangle(annotated, (x0, y0), (x1, y1), (0, 255, 0), 1)
+            cv2.putText(
+                annotated,
+                f"{label}" if conf >= 0.3 else "?",
+                (x0, y0 - 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+        cv2.imwrite("tab_boxes.png", annotated)
+        print("[DEBUG] Digit boxes saved → tab_boxes.png")
 
 
 if __name__ == '__main__':
