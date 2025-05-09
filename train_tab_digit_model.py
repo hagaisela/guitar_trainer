@@ -177,14 +177,15 @@ class TabDigitSequence(keras.utils.Sequence):
 # -----------------------------------------------------------------------------
 
 def build_model() -> keras.Model:
+    """Return a slightly wider CNN (~140 k params, still instant inference)."""
     inputs = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 1))
-    x = layers.Conv2D(16, 3, activation="relu")(inputs)
-    x = layers.MaxPooling2D()(x)
-    x = layers.Conv2D(32, 3, activation="relu")(x)
+    x = layers.Conv2D(32, 3, activation="relu")(inputs)
     x = layers.MaxPooling2D()(x)
     x = layers.Conv2D(64, 3, activation="relu")(x)
+    x = layers.MaxPooling2D()(x)
+    x = layers.Conv2D(128, 3, activation="relu")(x)
     x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dense(64, activation="relu")(x)
+    x = layers.Dense(128, activation="relu")(x)
     outputs = layers.Dense(len(LABELS), activation="softmax")(x)
     model = keras.Model(inputs, outputs)
     model.compile(
