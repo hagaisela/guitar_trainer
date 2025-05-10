@@ -48,12 +48,26 @@ SEED = 1234
 random.seed(SEED); np.random.seed(SEED); tf.random.set_seed(SEED)
 
 # -----------------------------------------------------------------------------
+# Pillow version compatibility helpers (>=10 moved resampling enums)
+# -----------------------------------------------------------------------------
+try:  # Pillow ≥10
+    AFFINE = Image.Transform.AFFINE  # type: ignore[attr-defined]
+except AttributeError:  # Pillow <10
+    AFFINE = Image.AFFINE  # type: ignore[attr-defined]
+
+try:
+    BILINEAR = Image.Resampling.BILINEAR  # type: ignore[attr-defined]
+    LANCZOS = Image.Resampling.LANCZOS    # type: ignore[attr-defined]
+except AttributeError:
+    BILINEAR = Image.BILINEAR  # type: ignore[attr-defined]
+    LANCZOS = Image.LANCZOS    # type: ignore[attr-defined]
+
+# -----------------------------------------------------------------------------
 # Synthetic image generator
 # -----------------------------------------------------------------------------
 CHARS = [str(n) for n in range(10)]  # individual digits used to compose 0-24
 LABELS = list(range(25))  # fret numbers 0-24 inclusive
 IMG_SIZE = 40  # output image is IMG_SIZE×IMG_SIZE grayscale
-
 
 def _load_fonts(extra_fonts: List[Path] | None = None) -> List[ImageFont.FreeTypeFont]:
     """Return a list of PIL ImageFont objects for random selection."""
@@ -76,78 +90,97 @@ def _load_fonts(extra_fonts: List[Path] | None = None) -> List[ImageFont.FreeTyp
         raise RuntimeError("No usable TTF fonts found — install e.g. 'ttf-dejavu'.")
     return fonts
 
+# Extra thin / proportional fonts (added to default monospace set)
+EXTRA_FONTS = [
+    "assets/fonts/RobotoCondensed-Regular.ttf",
+    "assets/fonts/FreeSerif.ttf",
+    "assets/fonts/DejaVuSerif.ttf",
+]
 
-def _generate_sample(label: int, fonts: List[ImageFont.FreeTypeFont]) -> Tuple[np.ndarray, int]:
-    """Return (image, label) as numpy array in range [0,1]."""
+# Initialise global font list once the helper is defined
+FONTS = _load_fonts(extra_fonts=[Path(p) for p in EXTRA_FONTS])
+
+def _generate_sample(label: int) -> Tuple[np.ndarray, int]:
     assert 0 <= label <= 24
-    text = str(label)
 
-    # Create blank canvas (white background)
-    img = Image.new("L", (IMG_SIZE, IMG_SIZE), color=255)
+    # Canvas: *black* or *white* with 50 % probability
+    bg_white  = random.random() < 0.5
+    bg_colour = 255 if bg_white else 0
+    img = Image.new("L", (IMG_SIZE, IMG_SIZE), color=bg_colour)
     draw = ImageDraw.Draw(img)
 
-    # Random font / size  (video digits are ~26-38 px on a 40-px crop)
-    font = random.choice(fonts)
-    font_size = random.randint(24, 44)
-    font = ImageFont.truetype(font.path if hasattr(font, "path") else font.font.family, font_size)
-
-    # Measure text size (Pillow ≥10 dropped textsize; use textbbox if available)
+    # •  Font: anywhere from 18 px (thin) to 46 px (thick)
+    font_obj = random.choice(FONTS)           # pre-loaded FreeTypeFont
+    font_size = random.randint(18, 46)
+    # Need the original TTF path so we can reload at the desired size.
     try:
-        text_bbox = draw.textbbox((0, 0), text, font=font)
-        text_w, text_h = text_bbox[2] - text_bbox[0], text_bbox[3] - text_bbox[1]
-    except AttributeError:  # Pillow <10 provides textsize
-        text_w, text_h = draw.textsize(text, font=font)
+        tt_path = font_obj.path               # Pillow ≥9 FreeTypeFont carries .path
+    except AttributeError:
+        # Fallback: construct from font family (works on macOS dfont)
+        tt_path = font_obj.font.family if hasattr(font_obj, "font") else None
 
-    # Random position (keep fully inside canvas)
-    max_x = IMG_SIZE - text_w
-    max_y = IMG_SIZE - text_h
-    x = random.randint(0, max(0, max_x))
-    y = random.randint(0, max(0, max_y))
+    if tt_path is None:
+        # As a last resort just reuse the original 32-px object (size mismatch ok)
+        font = font_obj
+    else:
+        font = ImageFont.truetype(tt_path, font_size)
 
-    # Random text colour (black / very dark grey)
-    colour = random.randint(0, 50)
-    # Draw with an outline so thin fonts become bold → closer to Guitar-Pro export
-    stroke_w = random.choice([1, 2])
+    # Stroke width 0–2 so glyphs may be very thin
+    stroke_w  = random.choice([0, 1, 2])
+
+    text = str(label)
+    bbox  = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_w)
+    tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+
+    # If glyph exceeds canvas, clamp placement to (0,0)
+    max_x = max(0, IMG_SIZE - tw)
+    max_y = max(0, IMG_SIZE - th)
+    x = random.randint(0, max_x)
+    y = random.randint(0, max_y)
+
+    colour = 0 if bg_white else 255           # ensure contrast
     draw.text((x, y), text, fill=colour, font=font,
               stroke_width=stroke_w, stroke_fill=colour)
 
-    # Optionally draw TAB staff lines (6 horizontal lines)
-    if random.random() < 0.7:
-        spacing = random.randint(4, 6)
-        max_top = IMG_SIZE - spacing * 5 - 1
-        min_top = 0  # allow anywhere when constrained
-        if max_top <= min_top:
-            top = 0  # degenerate fallback; still draws within canvas
-        else:
-            top = random.randint(min_top, max_top)
-        for i in range(6):
-            y_line = top + i * spacing
-            draw.line((0, y_line, IMG_SIZE, y_line), fill=random.randint(100, 160), width=1)
-
-    # Small rotation ±8°
+    # •  50 % of the time: *no* TAB lines at all  (videos sometimes omit them)
     if random.random() < 0.5:
-        angle = random.uniform(-8, 8)
-        img = img.rotate(angle, resample=Image.BILINEAR, expand=False, fillcolor=255)
+        pass
+    else:
+        spacing = random.randint(4, 6)
+        top = random.randint(0, IMG_SIZE - spacing*5 - 1)
+        grey = random.randint(120, 190)
+        for i in range(6):
+            y_line = top + i*spacing
+            draw.line((0, y_line, IMG_SIZE, y_line), fill=grey, width=1)
 
-    # Random morphological noise – favour **thickening**
-    rnd = random.random()
-    if rnd < 0.15:
-        img = img.filter(ImageFilter.MinFilter(3))          # 15 % thinner
-    elif rnd < 0.65:
-        img = img.filter(ImageFilter.MaxFilter(3))          # 50 % thicker
-    # remaining 30 % stay unchanged
-
-    # Downscale & upsample to introduce anti-aliasing artefacts (30 % chance)
+    # •  Perspective / shear   (mimic handheld-camera skew)
     if random.random() < 0.3:
-        factor = random.uniform(0.5, 0.8)
-        new_w = max(1, int(IMG_SIZE * factor))
-        new_h = max(1, int(IMG_SIZE * factor))
-        img_small = img.resize((new_w, new_h), Image.LANCZOS)
-        img = img_small.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
+        shear = random.uniform(-0.3, 0.3)
+        img = img.transform(img.size, AFFINE, (1, shear, 0, 0, 1, 0),
+                            resample=BILINEAR, fillcolor=bg_colour)
 
-    arr = np.asarray(img, dtype=np.float32) / 255.0  # normalise 0-1
-    arr = 1.0 - arr  # invert: digits white on black (improves contrast)
-    arr = np.expand_dims(arr, axis=-1)  # HWC→HWC1
+    # •  JPEG / motion blur  (YouTube artefacts)
+    if random.random() < 0.3:
+        img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.6, 1.4)))
+    if random.random() < 0.3:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=random.randint(30, 60))
+        img = Image.open(buf)
+
+    # Optional rotation (kept from original code)
+    if random.random() < 0.4:
+        angle = random.uniform(-8, 8)
+        img = img.rotate(angle, resample=BILINEAR, expand=False,
+                         fillcolor=bg_colour)
+
+    # ✗  Remove Max/Min filters — dilation/erosion is now redundant
+    # -----------------------------------------------------------------
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+
+    # •  Always convert to "digit-white on black" because the model expects that.
+    if bg_white:
+        arr = 1.0 - arr
+    arr  = np.expand_dims(arr, axis=-1)
     return arr, label
 
 
@@ -167,7 +200,7 @@ class TabDigitSequence(keras.utils.Sequence):
         y = np.zeros((self.batch_size,), dtype=np.int32)
         for i in range(self.batch_size):
             lbl = random.randint(0, 24)
-            img, label = _generate_sample(lbl, self.fonts)
+            img, label = _generate_sample(lbl)
             x[i] = img
             y[i] = label
         return x, keras.utils.to_categorical(y, num_classes=len(LABELS))
@@ -225,7 +258,7 @@ def main():  # noqa: C901
         preview_dir.mkdir(parents=True, exist_ok=True)
         for i in range(25):
             label = random.randint(0, 24)
-            arr, lbl = _generate_sample(label, fonts)
+            arr, lbl = _generate_sample(label)
             # Convert back to PIL.Image for saving (invert again so digits dark)
             img = (1.0 - arr[:, :, 0]) * 255.0
             img_pil = Image.fromarray(img.astype(np.uint8), mode="L")

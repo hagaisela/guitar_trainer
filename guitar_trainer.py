@@ -474,7 +474,7 @@ class GuitarTrainerApp(Gtk.Window):
                 self.update_status("Failed to change speed")
 
     def on_pitch_sample(self, appsink):
-        print("on_pitch_sample called")
+        # print("on_pitch_sample called")
         global np, librosa
         if np is None:
             try:
@@ -546,7 +546,7 @@ class GuitarTrainerApp(Gtk.Window):
             freq_smoothed = float(np.median(self.recent_pitches))
 
             note = self.freq_to_note_name(freq_smoothed)
-            print(f"Detected pitch: {note} {freq_smoothed:.0f}Hz")
+            # print(f"Detected pitch: {note} {freq_smoothed:.0f}Hz")
             GLib.idle_add(self.pitch_label.set_text,
                           f"{note} ({freq_smoothed:.0f} Hz)")
         finally:
@@ -571,7 +571,7 @@ class GuitarTrainerApp(Gtk.Window):
         At this stage we only print and keep a placeholder for future TAB
         column-advance logic.
         """
-        print("Onset detected (aubioonset)")
+        # print("Onset detected (aubioonset)")
 
         # Ensure the highlight overlay exists
         if not self.tab_highlight:
@@ -795,14 +795,14 @@ class GuitarTrainerApp(Gtk.Window):
                 cv2.rectangle(dbg, (x, y), (x + w_box, y + h_box), (0, 255, 0), 2)
                 cv2.imwrite("tab_detect.png", dbg)
 
-                # Optionally detect and annotate digits within TAB area
-                if self.digit_model is not None:
-                    self.detect_tab_digits(frame_bgr, bbox)
-
                 # Update highlight overlay in GTK thread
                 if self.tab_highlight:
                     self.highlight_rects = [bbox]
                     GLib.idle_add(self.tab_highlight.queue_draw)
+
+                # Optionally detect and annotate digits within TAB area
+                if self.digit_model is not None:
+                    self.detect_tab_digits(frame_bgr, bbox)
 
             print(f"[DEBUG] First frame captured ({w}x{h_real}, bpp={bpp}) -> debug_frame.png")
             self.frame_captured = True
@@ -1076,17 +1076,31 @@ class GuitarTrainerApp(Gtk.Window):
 
         annotated = roi_bgr.copy()
 
+        PAD = 4  # pixels of extra margin around each detected digit box
+
         for i, (x0, y0, x1, y1) in enumerate(merged):
-            crop = digits_mask[y0:y1, x0:x1]
+            # Expand the box slightly to avoid clipping ascenders/descenders
+            x0e = max(0, x0 - PAD)
+            y0e = max(0, y0 - PAD)
+            x1e = min(digits_mask.shape[1], x1 + PAD)
+            y1e = min(digits_mask.shape[0], y1 + PAD)
+
+            crop_src = digits_mask[y0e:y1e, x0e:x1e]
+            # Invert colours so digits are black on white BEFORE _prep_digit_crop,
+            # which then flips again → digits white on black (matching training).
+            crop = cv2.bitwise_not(crop_src)
             if crop.size == 0:
                 continue
+            # Pass crop as-is (white digits on black) to _prep_digit_crop,
+            # which will normalise and invert internally to match the model.
             inp = self._prep_digit_crop(crop)
             cv2.imwrite(f"debug_crop_{i}.png",
                         (inp[0, :, :, 0] * 255).astype(np.uint8))
             try:
                 pred = self.digit_model.predict(inp, verbose=0)
-                label = int(np.argmax(pred))
                 conf = float(np.max(pred))
+                label = int(np.argmax(pred))
+                print(f"[DEBUG] box {i}: label={label} (conf={conf:.2f})")
             except Exception as exc:
                 print("[WARN] digit prediction failed:", exc)
                 continue
