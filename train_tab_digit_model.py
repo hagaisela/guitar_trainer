@@ -100,7 +100,9 @@ EXTRA_FONTS = [
 # Initialise global font list once the helper is defined
 FONTS = _load_fonts(extra_fonts=[Path(p) for p in EXTRA_FONTS])
 
-def _generate_sample(label: int) -> Tuple[np.ndarray, int]:
+def _generate_sample(label: int, *, fonts: List[ImageFont.FreeTypeFont] | None = None) -> Tuple[np.ndarray, int]:
+    """Return *(image, label)* with digit white-on-black."""
+
     assert 0 <= label <= 24
 
     # Canvas: *black* or *white* with 50 % probability
@@ -110,7 +112,8 @@ def _generate_sample(label: int) -> Tuple[np.ndarray, int]:
     draw = ImageDraw.Draw(img)
 
     # •  Font: anywhere from 18 px (thin) to 46 px (thick)
-    font_obj = random.choice(FONTS)           # pre-loaded FreeTypeFont
+    font_pool = fonts if fonts else FONTS
+    font_obj = random.choice(font_pool)       # pre-loaded FreeTypeFont
     font_size = random.randint(18, 46)
     # Need the original TTF path so we can reload at the desired size.
     try:
@@ -200,7 +203,7 @@ class TabDigitSequence(keras.utils.Sequence):
         y = np.zeros((self.batch_size,), dtype=np.int32)
         for i in range(self.batch_size):
             lbl = random.randint(0, 24)
-            img, label = _generate_sample(lbl)
+            img, label = _generate_sample(lbl, fonts=self.fonts)
             x[i] = img
             y[i] = label
         return x, keras.utils.to_categorical(y, num_classes=len(LABELS))
@@ -258,7 +261,7 @@ def main():  # noqa: C901
         preview_dir.mkdir(parents=True, exist_ok=True)
         for i in range(25):
             label = random.randint(0, 24)
-            arr, lbl = _generate_sample(label)
+            arr, lbl = _generate_sample(label, fonts=fonts)
             # Convert back to PIL.Image for saving (invert again so digits dark)
             img = (1.0 - arr[:, :, 0]) * 255.0
             img_pil = Image.fromarray(img.astype(np.uint8), mode="L")
