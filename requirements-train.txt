@@ -1,0 +1,7 @@
+tensorflow==2.13.1  # CPU-only wheel for Linux × Python ≤3.11
+pillow>=9.5.0           # image synthesis
+numpy>=1.23             # numeric OPS + tf dep
+fonttools>=4.50         # TrueType font loading via Pillow
+# progress bar utility – optional but used by the script
+# (tensorflow pulls in tqdm transiently, but keep it explicit)
+tqdm>=4.66 
