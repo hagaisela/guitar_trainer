@@ -43,6 +43,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from tensorflow import keras
 from tensorflow.keras import layers
 import tensorflow as tf
+import cv2
 
 SEED = 1234
 random.seed(SEED); np.random.seed(SEED); tf.random.set_seed(SEED)
@@ -104,7 +105,7 @@ EXTRA_FONTS = [
 # Initialise global font list once the helper is defined
 FONTS = _load_fonts(extra_fonts=[Path(p) for p in EXTRA_FONTS])
 
-def _generate_sample(label: int, *, fonts: List[ImageFont.FreeTypeFont] | None = None) -> Tuple[np.ndarray, int]:
+def _generate_sample(label: int, *, fonts: List[ImageFont.FreeTypeFont] | None = None, line_prob: float = 0.3) -> Tuple[np.ndarray, int]:
     """Return *(image, label)* with digit white-on-black."""
 
     assert 0 <= label <= 24
@@ -149,16 +150,31 @@ def _generate_sample(label: int, *, fonts: List[ImageFont.FreeTypeFont] | None =
     draw.text((x, y), text, fill=colour, font=font,
               stroke_width=stroke_w, stroke_fill=colour)
 
-    # •  50 % of the time: *no* TAB lines at all  (videos sometimes omit them)
-    if random.random() < 0.5:
-        pass
-    else:
-        spacing = random.randint(4, 6)
-        top = random.randint(0, IMG_SIZE - spacing*5 - 1)
+    # Draw the six TAB staff lines with probability *line_prob* to match the
+    # cleaned-crop distribution (typically 20–30 %).
+    if random.random() < line_prob:
+        # Draw 1–3 horizontal lines.  70 % of the time it's just one line
+        # (the most common residual after line-removal), 20 % two, 10 % three.
+        n_lines = random.choices([1, 2, 3], weights=[0.7, 0.2, 0.1])[0]
+
+        # y-centre of the digit so we can ensure one line crosses it.
+        y_centre = y + th // 2
+
+        # Candidate vertical offsets (in pixels) relative to the centre line.
+        # We favour small offsets so extra lines sit close to the glyph.
+        cand_offs = [0, -4, 4, -8, 8]
+        offs = [0]
+        if n_lines > 1:
+            # Choose additional unique offsets (positive or negative) aside from 0.
+            extra = random.sample(cand_offs[1:], k=n_lines - 1)
+            offs.extend(extra)
+
         grey = random.randint(120, 190)
-        for i in range(6):
-            y_line = top + i*spacing
-            draw.line((0, y_line, IMG_SIZE, y_line), fill=grey, width=1)
+        thickness = random.choice([1, 1, 2])
+        for off in offs:
+            y_line = y_centre + off
+            if 0 <= y_line < IMG_SIZE:
+                draw.line((0, y_line, IMG_SIZE, y_line), fill=grey, width=thickness)
 
     # •  Perspective / shear   (mimic handheld-camera skew)
     if random.random() < 0.3:
@@ -280,10 +296,11 @@ def _generate_sample_realistic(label: int, *, fonts: List[ImageFont.FreeTypeFont
 class TabDigitSequence(keras.utils.Sequence):
     """Keras data generator that synthesises images on the fly."""
 
-    def __init__(self, batch_size: int, steps: int, fonts: List[ImageFont.FreeTypeFont]):
+    def __init__(self, batch_size: int, steps: int, fonts: List[ImageFont.FreeTypeFont], line_prob: float = 0.3):
         self.batch_size = batch_size
         self.steps = steps
         self.fonts = fonts
+        self.line_prob = line_prob
 
     def __len__(self) -> int:
         return self.steps
@@ -293,7 +310,7 @@ class TabDigitSequence(keras.utils.Sequence):
         y = np.zeros((self.batch_size,), dtype=np.int32)
         for i in range(self.batch_size):
             lbl = random.randint(0, 24)
-            img, lab = _generate_sample(lbl, fonts=self.fonts)
+            img, lab = _generate_sample(lbl, fonts=self.fonts, line_prob=self.line_prob)
             x[i] = img; y[i] = lab
         return x, keras.utils.to_categorical(y, num_classes=len(LABELS))
 
@@ -334,7 +351,7 @@ def main():  # noqa: C901
     parser.add_argument("--out", type=str, default=".", help="output directory")
     parser.add_argument("--font", action="append", type=str, help="additional .ttf font file to include")
     parser.add_argument("--preview", action="store_true", help="generate 25 sample images then exit")
-    parser.add_argument("--realistic", action="store_true", help="use full TAB-style generator")
+    parser.add_argument("--line-prob", type=float, default=0.3, help="probability that a synthetic sample includes the six TAB staff lines (0-1)")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -343,8 +360,8 @@ def main():  # noqa: C901
     fonts = _load_fonts([Path(f) for f in args.font] if args.font else None)
     print(f"Loaded {len(fonts)} fonts for augmentation")
 
-    # Choose the appropriate generator function once
-    gen_fn = _generate_sample_realistic if args.realistic else _generate_sample
+    # Single generator with configurable probabilities
+    gen_fn = _generate_sample
 
     # -----------------------------------------------------------------
     # Preview mode: save a handful of random samples and exit early
@@ -354,7 +371,7 @@ def main():  # noqa: C901
         preview_dir.mkdir(parents=True, exist_ok=True)
         for i in range(25):
             label = random.randint(0, 24)
-            arr, lbl = gen_fn(label, fonts=fonts)
+            arr, lbl = gen_fn(label, fonts=fonts, line_prob=args.line_prob)
             # Save in the same polarity used at inference time: white digit on black
             img = arr[:, :, 0] * 255.0
             img_pil = Image.fromarray(img.astype(np.uint8), mode="L")
@@ -365,8 +382,8 @@ def main():  # noqa: C901
     class _Seq(TabDigitSequence):
         """TabDigitSequence that uses the chosen generator function."""
 
-        def __init__(self, batch_size: int, steps: int, fonts):
-            super().__init__(batch_size, steps, fonts)
+        def __init__(self, batch_size: int, steps: int, fonts, line_prob: float):
+            super().__init__(batch_size, steps, fonts, line_prob=line_prob)
             self.gen_fn = gen_fn
 
         def __getitem__(self, idx):  # type: ignore[override]
@@ -374,12 +391,12 @@ def main():  # noqa: C901
             y = np.zeros((self.batch_size,), dtype=np.int32)
             for i in range(self.batch_size):
                 lbl = random.randint(0, 24)
-                img, lab = self.gen_fn(lbl, fonts=self.fonts)
+                img, lab = self.gen_fn(lbl, fonts=self.fonts, line_prob=self.line_prob)
                 x[i] = img; y[i] = lab
             return x, keras.utils.to_categorical(y, num_classes=len(LABELS))
 
-    train_gen = _Seq(args.batch_size, args.steps_per_epoch, fonts)
-    val_gen   = _Seq(args.batch_size, args.val_steps, fonts)
+    train_gen = _Seq(args.batch_size, args.steps_per_epoch, fonts, args.line_prob)
+    val_gen   = _Seq(args.batch_size, args.val_steps, fonts, args.line_prob)
 
     model = build_model()
     model.summary()
