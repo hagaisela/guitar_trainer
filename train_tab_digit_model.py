@@ -72,6 +72,7 @@ IMG_SIZE = 40  # output image is IMG_SIZE×IMG_SIZE grayscale
 def _load_fonts(extra_fonts: List[Path] | None = None) -> List[ImageFont.FreeTypeFont]:
     """Return a list of PIL ImageFont objects for random selection."""
     candidates = [
+        "/usr/local/opt/font-dejavu/lib/fonts/DejaVuSansMono.ttf",  # brew install font-dejavu
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
         "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
@@ -87,7 +88,10 @@ def _load_fonts(extra_fonts: List[Path] | None = None) -> List[ImageFont.FreeTyp
         except Exception:
             pass  # ignore missing fonts
     if not fonts:
-        raise RuntimeError("No usable TTF fonts found — install e.g. 'ttf-dejavu'.")
+        # Fallback to PIL's built-in bitmap font so script still runs, albeit
+        # with limited appearance diversity.
+        print("[WARN] No TrueType fonts found – falling back to PIL default font. Accuracy may be lower.")
+        fonts.append(ImageFont.load_default())
     return fonts
 
 # Extra thin / proportional fonts (added to default monospace set)
@@ -180,12 +184,98 @@ def _generate_sample(label: int, *, fonts: List[ImageFont.FreeTypeFont] | None =
     # -----------------------------------------------------------------
     arr = np.asarray(img, dtype=np.float32) / 255.0
 
-    # •  Always convert to "digit-white on black" because the model expects that.
-    if bg_white:
+    # If background happens to be white (bg_colour = 255), invert so the
+    # model always sees *white digit on black*.
+    if bg_colour == 255:
         arr = 1.0 - arr
     arr  = np.expand_dims(arr, axis=-1)
     return arr, label
 
+def _generate_sample_realistic(label: int, *, fonts: List[ImageFont.FreeTypeFont] | None = None) -> Tuple[np.ndarray, int]:
+    """Return *(image, label)* mimicking the *cropped* frame detector.
+
+    Key differences from the simple generator:
+    1. Always draws 6 TAB staff lines and *usually* (80 %) vertical frame bars.
+    2. Uses proportional fonts (Roboto/Arial‐like) more often.
+    3. Adds an optional trailing timing dot (2–3 px) right of the glyph.
+    4. Post-renders JPEG compression + blur matching YouTube artefacts.
+    The output is still a 40×40 monochrome crop with *white* digit on black.
+    """
+
+    assert 0 <= label <= 24
+    IMG_W, IMG_H = IMG_SIZE, IMG_SIZE
+    bg_colour = 0  # black background
+    img = Image.new("L", (IMG_W, IMG_H), color=bg_colour)
+    draw = ImageDraw.Draw(img)
+
+    # ── staff lines (always present in realistic generator)
+    spacing = random.randint(4, 6)
+    top = random.randint(4, IMG_H - spacing * 5 - 4)
+    line_col = random.randint(160, 220)
+    for i in range(6):
+        y_line = top + i * spacing
+        draw.line((0, y_line, IMG_W, y_line), fill=line_col, width=1)
+
+    # ── vertical frame bars (80 % probability to mimic variety in sources)
+    if random.random() < 0.8:
+        bar_w = random.choice([1, 2])
+        bar_col = 255  # pure white so they are always visible
+        draw.rectangle((0, 0, bar_w - 1, IMG_H - 1), fill=bar_col)
+        draw.rectangle((IMG_W - bar_w, 0, IMG_W - 1, IMG_H - 1), fill=bar_col)
+    else:
+        bar_w = 0  # used later for digit placement bounds
+
+    # ── font selection
+    font_pool = fonts if fonts else FONTS
+    font_obj = random.choice(font_pool)
+    font_size = random.randint(20, 44)
+    try:
+        tt_path = font_obj.path
+    except AttributeError:
+        tt_path = font_obj.font.family if hasattr(font_obj, "font") else None
+    font = ImageFont.truetype(tt_path, font_size) if tt_path else font_obj
+
+    stroke_w = random.choice([0, 1])
+
+    text = str(label)
+    tw, th = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_w)[2:4]
+
+    # Leave 2 px from potential frame bar + small jitter, guard against
+    # negative range when the glyph is almost full width/height.
+    min_x = bar_w + 2
+    max_x = IMG_W - bar_w - tw - 2
+    if max_x <= min_x:
+        x = min_x
+    else:
+        x = random.randint(min_x, max_x)
+
+    max_y = IMG_H - th
+    y = 0 if max_y <= 0 else random.randint(0, max_y)
+
+    draw.text((x, y), text, fill=255, font=font,
+              stroke_width=stroke_w, stroke_fill=255)
+
+    # ── optional timing dot (5 %)
+    if random.random() < 0.05 and x + tw + 4 < IMG_W - bar_w:
+        cx = x + tw + random.randint(2, 3)
+        cy = y + th // 2
+        draw.rectangle((cx, cy, cx + 2, cy + 2), fill=255)
+
+    # ── YouTube-like artefacts
+    if random.random() < 0.4:
+        img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.4, 0.9)))
+    if random.random() < 0.4:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=random.randint(35, 60))
+        img = Image.open(buf)
+
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    # Maintain white digit on black. Our background is 0 (black) so normally
+    # no inversion is needed; keep a conditional guard for completeness.
+    if bg_colour == 255:
+        arr = 1.0 - arr
+    arr = np.expand_dims(arr, axis=-1)
+    return arr, label
 
 class TabDigitSequence(keras.utils.Sequence):
     """Keras data generator that synthesises images on the fly."""
@@ -198,14 +288,13 @@ class TabDigitSequence(keras.utils.Sequence):
     def __len__(self) -> int:
         return self.steps
 
-    def __getitem__(self, idx):  # pylint: disable=unused-argument
+    def __getitem__(self, idx):  # type: ignore
         x = np.zeros((self.batch_size, IMG_SIZE, IMG_SIZE, 1), dtype=np.float32)
         y = np.zeros((self.batch_size,), dtype=np.int32)
         for i in range(self.batch_size):
             lbl = random.randint(0, 24)
-            img, label = _generate_sample(lbl, fonts=self.fonts)
-            x[i] = img
-            y[i] = label
+            img, lab = _generate_sample(lbl, fonts=self.fonts)
+            x[i] = img; y[i] = lab
         return x, keras.utils.to_categorical(y, num_classes=len(LABELS))
 
 # -----------------------------------------------------------------------------
@@ -245,6 +334,7 @@ def main():  # noqa: C901
     parser.add_argument("--out", type=str, default=".", help="output directory")
     parser.add_argument("--font", action="append", type=str, help="additional .ttf font file to include")
     parser.add_argument("--preview", action="store_true", help="generate 25 sample images then exit")
+    parser.add_argument("--realistic", action="store_true", help="use full TAB-style generator")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -252,6 +342,9 @@ def main():  # noqa: C901
 
     fonts = _load_fonts([Path(f) for f in args.font] if args.font else None)
     print(f"Loaded {len(fonts)} fonts for augmentation")
+
+    # Choose the appropriate generator function once
+    gen_fn = _generate_sample_realistic if args.realistic else _generate_sample
 
     # -----------------------------------------------------------------
     # Preview mode: save a handful of random samples and exit early
@@ -261,16 +354,32 @@ def main():  # noqa: C901
         preview_dir.mkdir(parents=True, exist_ok=True)
         for i in range(25):
             label = random.randint(0, 24)
-            arr, lbl = _generate_sample(label, fonts=fonts)
-            # Convert back to PIL.Image for saving (invert again so digits dark)
-            img = (1.0 - arr[:, :, 0]) * 255.0
+            arr, lbl = gen_fn(label, fonts=fonts)
+            # Save in the same polarity used at inference time: white digit on black
+            img = arr[:, :, 0] * 255.0
             img_pil = Image.fromarray(img.astype(np.uint8), mode="L")
             img_pil.save(preview_dir / f"sample_{i:02d}_lbl{lbl}.png")
         print(f"Preview images written to {preview_dir} → exiting")
         return
 
-    train_gen = TabDigitSequence(args.batch_size, args.steps_per_epoch, fonts)
-    val_gen = TabDigitSequence(args.batch_size, args.val_steps, fonts)
+    class _Seq(TabDigitSequence):
+        """TabDigitSequence that uses the chosen generator function."""
+
+        def __init__(self, batch_size: int, steps: int, fonts):
+            super().__init__(batch_size, steps, fonts)
+            self.gen_fn = gen_fn
+
+        def __getitem__(self, idx):  # type: ignore[override]
+            x = np.zeros((self.batch_size, IMG_SIZE, IMG_SIZE, 1), dtype=np.float32)
+            y = np.zeros((self.batch_size,), dtype=np.int32)
+            for i in range(self.batch_size):
+                lbl = random.randint(0, 24)
+                img, lab = self.gen_fn(lbl, fonts=self.fonts)
+                x[i] = img; y[i] = lab
+            return x, keras.utils.to_categorical(y, num_classes=len(LABELS))
+
+    train_gen = _Seq(args.batch_size, args.steps_per_epoch, fonts)
+    val_gen   = _Seq(args.batch_size, args.val_steps, fonts)
 
     model = build_model()
     model.summary()

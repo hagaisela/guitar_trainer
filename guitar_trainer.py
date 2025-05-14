@@ -1002,7 +1002,10 @@ class GuitarTrainerApp(Gtk.Window):
         import numpy as _np  # local import to avoid top-level requirement
         h_c, w_c = crop_gray_inv.shape
         size = max(h_c, w_c)
-        padded = _np.zeros((size, size), dtype=_np.uint8)
+        # Use white (255) for the padding background so that after the final
+        # inversion step the padding becomes black.  This avoids the bright
+        # border lines that were visible in the 40×40 debug crops.
+        padded = _np.full((size, size), 255, dtype=_np.uint8)
         y_off = (size - h_c) // 2
         x_off = (size - w_c) // 2
         padded[y_off:y_off + h_c, x_off:x_off + w_c] = crop_gray_inv
@@ -1086,6 +1089,11 @@ class GuitarTrainerApp(Gtk.Window):
             y1e = min(digits_mask.shape[0], y1 + PAD)
 
             crop_src = digits_mask[y0e:y1e, x0e:x1e]
+            # NEW: save the raw threshold crop *before* line removal so we can
+            # inspect whether horizontal staff lines are still present.  We
+            # invert colours for readability (black digits/lines on white).
+            raw_crop = thresh_inv[y0e:y1e, x0e:x1e]
+            cv2.imwrite(f"debug_crop_raw_{i}.png", 255 - raw_crop)
             # Invert colours so digits are black on white BEFORE _prep_digit_crop,
             # which then flips again → digits white on black (matching training).
             crop = cv2.bitwise_not(crop_src)
