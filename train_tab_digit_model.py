@@ -43,7 +43,6 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from tensorflow import keras
 from tensorflow.keras import layers
 import tensorflow as tf
-import cv2
 
 SEED = 1234
 random.seed(SEED); np.random.seed(SEED); tf.random.set_seed(SEED)
