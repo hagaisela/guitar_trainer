@@ -15,6 +15,7 @@ import sys
 import threading
 import yt_dlp
 from collections import deque
+import time
 try:
     import numpy as np
 except Exception as e:
@@ -66,10 +67,15 @@ class GuitarTrainerApp(Gtk.Window):
         self.playbin = None
         self.videosink = None
         self.pitch_appsink = None  # For pitch detection
+        self.onset_appsink = None  # For onset detection
         self.pitch_buffer = None  # For accumulating audio samples
+        self.onset_buffer = None  # numpy buffer for fallback onset detection
         self.recent_pitches = deque(maxlen=5)  # Keep last 5 pitches for smoothing
         self.last_position = 0  # Track last playback position
         self.is_playing = False  # Track play state
+        self.pitch_sampling_interval = 0.1  # 100ms between regular pitch samples
+        self.last_pitch_time = 0  # For regular pitch sampling
+        self.last_onset_time = 0  # For onset detection
 
         # Create main layout
         self.main_box = Gtk.Box(
@@ -115,9 +121,12 @@ class GuitarTrainerApp(Gtk.Window):
         self.speed_box = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         self.speed_label = Gtk.Label(label="Playback Speed:")
+        # Change to continuous scale with finer control
         self.speed_scale = Gtk.Scale.new_with_range(
-            Gtk.Orientation.HORIZONTAL, 0.25, 2.0, 0.25)
+            Gtk.Orientation.HORIZONTAL, 0.1, 2.0, 0.01)  # 0.1x to 2.0x with 0.01 steps
         self.speed_scale.set_value(1.0)
+        self.speed_scale.set_digits(2)  # Show 2 decimal places
+        self.speed_scale.set_draw_value(True)  # Show the value
         self.speed_scale.connect("value-changed", self.on_speed_changed)
         self.speed_box.pack_start(self.speed_label, False, False, 0)
         self.speed_box.pack_start(self.speed_scale, True, True, 0)
@@ -141,7 +150,6 @@ class GuitarTrainerApp(Gtk.Window):
         self.col_width = 80         # pixel width per TAB column (heuristic)
         self.highlight_rects = []   # list[(x, y, w, h)] to draw each frame
         self.tab_highlight = None   # overlay widget created later in setup_pipeline
-        self.onset_buffer = None    # numpy buffer for fallback onset detection
         self.frame_captured = False  # Flag to track first-frame capture
         # ------------------------------------------------------------------
         # Digit-recognition CNN (trained via train_tab_digit_model.py)
@@ -183,10 +191,13 @@ class GuitarTrainerApp(Gtk.Window):
             # Create audio sink bin with tee for branching
             audio_sink_desc = (
                 "tee name=audio_tee ! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 ! "
-                "audioconvert ! audioresample ! autoaudiosink sync=false "
+                "audioconvert ! audioresample ! scaletempo ! autoaudiosink sync=false "
                 "audio_tee. ! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 ! "
                 "audioconvert ! audioresample ! capsfilter caps=audio/x-raw,format=F32LE,channels=1 ! "
-                "appsink name=pitch_appsink sync=false max-buffers=1 drop=true"
+                "appsink name=pitch_appsink sync=false max-buffers=1 drop=true "
+                "audio_tee. ! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 ! "
+                "audioconvert ! audioresample ! capsfilter caps=audio/x-raw,format=F32LE,channels=1 ! "
+                "appsink name=onset_appsink sync=false max-buffers=1 drop=true"
             )
             print(f"Creating audio sink bin with description: {audio_sink_desc}")
             self.audio_sink_bin = Gst.parse_bin_from_description(audio_sink_desc, True)
@@ -194,14 +205,17 @@ class GuitarTrainerApp(Gtk.Window):
                 print("Failed to create audio sink bin")
                 return
 
-            # Get the appsink from the bin
+            # Get the appsinks from the bin
             self.pitch_appsink = self.audio_sink_bin.get_by_name("pitch_appsink")
-            if not self.pitch_appsink:
-                print("Failed to get pitch_appsink from bin")
+            self.onset_appsink = self.audio_sink_bin.get_by_name("onset_appsink")
+            if not self.pitch_appsink or not self.onset_appsink:
+                print("Failed to get appsinks from bin")
                 return
-            print("Got pitch_appsink from bin")
+            print("Got appsinks from bin")
             self.pitch_appsink.set_property("emit-signals", True)
             self.pitch_appsink.connect("new-sample", self.on_pitch_sample)
+            self.onset_appsink.set_property("emit-signals", True)
+            self.onset_appsink.connect("new-sample", self.on_onset_sample)
 
             if not self.playbin or not self.videosink or not self.audio_sink_bin:
                 print("Failed to create elements")
@@ -288,11 +302,6 @@ class GuitarTrainerApp(Gtk.Window):
         elif t == Gst.MessageType.STREAM_STATUS:
             status = message.parse_stream_status()
             print(f"Stream status: {status.type.value_nick}")
-            if status.type == Gst.StreamStatusType.ERROR:
-                print("Stream error, resetting pipeline")
-                self.pipeline.set_state(Gst.State.NULL)
-                self.is_playing = False
-                self.last_position = 0
         elif t == Gst.MessageType.NEW_CLOCK:
             print("New clock selected")
         elif t == Gst.MessageType.STREAM_START:
@@ -315,12 +324,8 @@ class GuitarTrainerApp(Gtk.Window):
             print("Duration changed")
         elif t == Gst.MessageType.LATENCY:
             print("Latency message")
-        elif t == Gst.MessageType.STREAM_COLLECTION:
-            print("Stream collection")
-        elif t == Gst.MessageType.STREAMS_SELECTED:
-            print("Streams selected")
-        elif t == Gst.MessageType.REDIRECT:
-            print("Redirect message")
+        elif t == Gst.MessageType.STEP_DONE:
+            print("Step done")
         elif t == Gst.MessageType.ELEMENT:
             print(f"Element message: {message.src.get_name()}")
         elif t == Gst.MessageType.SEGMENT_START:
@@ -329,18 +334,12 @@ class GuitarTrainerApp(Gtk.Window):
             print("Segment done")
         elif t == Gst.MessageType.TOC:
             print("TOC message")
-        elif t == Gst.MessageType.PROPERTY_NOTIFY:
-            print("Property notify")
         elif t == Gst.MessageType.QOS:
             print("QOS message")
-        elif t == Gst.MessageType.SEEK_DONE:
-            print("Seek done")
         elif t == Gst.MessageType.NEED_CONTEXT:
             print("Need context")
         elif t == Gst.MessageType.HAVE_CONTEXT:
             print("Have context")
-        elif t == Gst.MessageType.ANY:
-            print("Any message")
         else:
             print(f"Unhandled message type: {t.value_nick}")
 
@@ -462,37 +461,44 @@ class GuitarTrainerApp(Gtk.Window):
 
     def on_speed_changed(self, scale):
         speed = scale.get_value()
-        if self.pipeline and self.playbin:
-            # Query the current playback position so we can seek from there
-            success, position = self.pipeline.query_position(Gst.Format.TIME)
-            if not success:
-                position = 0
+        if not self.pipeline or not self.is_playing:
+            return
 
-            print(
-                f"Changing playback speed to {speed}. Current position: {position}")
+        print(f"Changing playback speed to {speed:.2f}")
+        
+        # Get current position
+        success, position = self.pipeline.query_position(Gst.Format.TIME)
+        if not success:
+            print("Failed to query position")
+            return
 
-            # Build a seek event that only changes the playback rate while
-            # continuing from the current position. We use FLUSH so the
-            # pipeline updates immediately and ACCURATE to improve precision.
-            flags = Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE
+        # Build seek event with new rate
+        flags = (Gst.SeekFlags.FLUSH | 
+                Gst.SeekFlags.ACCURATE | 
+                Gst.SeekFlags.KEY_UNIT)  # Add KEY_UNIT for better seeking
 
-            # Seek to the current position with new speed
-            result = self.pipeline.seek(
-                speed,               # new playback rate
-                Gst.Format.TIME,
-                flags,
-                Gst.SeekType.SET,    # start type – absolute position
-                position,            # start position (current)
-                Gst.SeekType.NONE,   # stop type – play until the end
-                -1                    # stop position (ignored when NONE)
-            )
+        # Calculate stop position (end of stream)
+        success, duration = self.pipeline.query_duration(Gst.Format.TIME)
+        if not success:
+            duration = -1
 
-            if result:
-                print("Seek (rate change) successful")
-                self.update_status(f"Playback speed: {speed:.2f}x")
-            else:
-                print("Seek (rate change) failed")
-                self.update_status("Failed to change speed")
+        # Seek with new rate
+        result = self.pipeline.seek(
+            speed,               # rate
+            Gst.Format.TIME,
+            flags,
+            Gst.SeekType.SET,    # start type
+            position,            # start position
+            Gst.SeekType.SET,    # stop type
+            duration            # stop position
+        )
+
+        if result:
+            print(f"Speed change successful: {speed:.2f}x")
+            self.update_status(f"Playback speed: {speed:.2f}x")
+        else:
+            print("Speed change failed")
+            self.update_status("Failed to change speed")
 
     def on_pitch_sample(self, appsink):
         # print("on_pitch_sample called")
@@ -567,9 +573,28 @@ class GuitarTrainerApp(Gtk.Window):
             FMAX = librosa.note_to_hz('E6')  # 1319 Hz
 
             print(f"Running pitch detection on {len(data)} samples")
+            
+            # Check if this is a regular sampling or onset-triggered
+            current_time = time.time()
+            is_regular_sample = (current_time - self.last_pitch_time) >= self.pitch_sampling_interval
+            
+            # Only run pitch detection if:
+            # 1. This is a regular sample (every 100ms)
+            # 2. OR this is triggered by an onset (handled in on_onset_detected)
+            if not is_regular_sample and not hasattr(self, '_onset_triggered'):
+                return Gst.FlowReturn.OK
+                
+            # Clear onset trigger flag if it was set
+            if hasattr(self, '_onset_triggered'):
+                delattr(self, '_onset_triggered')
+                
+            # Update last pitch time for regular sampling
+            if is_regular_sample:
+                self.last_pitch_time = current_time
+
             f0, voiced_flag, _ = librosa.pyin(data, fmin=FMIN, fmax=FMAX,
-                                              sr=rate, frame_length=FRAME,
-                                              hop_length=len(data)-1)
+                                            sr=rate, frame_length=FRAME,
+                                            hop_length=len(data)-1)
 
             voiced = f0[voiced_flag]
             if voiced.size == 0:
@@ -601,40 +626,10 @@ class GuitarTrainerApp(Gtk.Window):
         return f"{name}{octave}"
 
     def on_onset_detected(self):
-        """Callback executed in the GTK main thread when aubioonset signals a new onset.
-
-        At this stage we only print and keep a placeholder for future TAB
-        column-advance logic.
-        """
-        # print("Onset detected (aubioonset)")
-
-        # Ensure the highlight overlay exists
-        if not self.tab_highlight:
-            return
-
-        alloc = self.tab_highlight.get_allocation()
-        width, height = alloc.width, alloc.height
-
-        # Lazily determine the TAB bounding box (bottom 35 % of frame)
-        if self.tab_bbox is None and width > 0 and height > 0:
-            bbox_y = int(height * 0.65)
-            bbox_h = int(height * 0.30)
-            self.tab_bbox = (0, bbox_y, width, bbox_h)
-
-        if self.tab_bbox is None:
-            return
-
-        # Advance column index and wrap when exceeding width
-        bbox_x, bbox_y, bbox_w, bbox_h = self.tab_bbox
-        self.tab_col = (self.tab_col + 1) % max(1, bbox_w // self.col_width)
-
-        x = bbox_x + self.tab_col * self.col_width
-        self.highlight_rects = [(x, bbox_y, self.col_width, bbox_h)]
-
-        print(f"tab_highlight allocation: {width}x{height}")
-        print(f"Highlight rects set to: {self.highlight_rects}")
-
-        self.tab_highlight.queue_draw()
+        """Called when an onset is detected, triggers immediate pitch detection."""
+        print("Onset detected, triggering pitch detection")
+        self._onset_triggered = True  # This will trigger pitch detection in the next sample
+        self.last_onset_time = time.time()
 
     # ---------------------------------------------------------------------
     # Gtk.DrawingArea draw callback for TAB highlight overlay
