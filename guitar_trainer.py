@@ -1048,7 +1048,7 @@ class GuitarTrainerApp(Gtk.Window):
         padded[y_off:y_off + h_c, x_off:x_off + w_c] = crop_gray_inv
 
         # Thicken strokes a bit (matches MaxFilter augmentation during training)
-        padded = cv2.dilate(padded, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+        # padded = cv2.dilate(padded, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)  # removed dilation to match training preprocessing
 
         resized = cv2.resize(padded, (40, 40), interpolation=cv2.INTER_NEAREST)
 
@@ -1081,6 +1081,10 @@ class GuitarTrainerApp(Gtk.Window):
         lines_removed = cv2.morphologyEx(thresh_inv, cv2.MORPH_OPEN, horiz_kernel, iterations=1)
         digits_mask = cv2.bitwise_xor(thresh_inv, lines_removed)
 
+        # (Optional) vertical bar-line removal disabled; caused over-erosion on some videos
+        # vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(max(10, h_box * 0.8))))
+        # digits_mask = cv2.morphologyEx(digits_mask, cv2.MORPH_OPEN, vert_kernel, iterations=1)
+
         # --------------------------------------------------------------
         # Cluster contours that belong to the *same column* (multi-digit)
         # --------------------------------------------------------------
@@ -1097,22 +1101,48 @@ class GuitarTrainerApp(Gtk.Window):
         # Sort left-to-right
         boxes.sort(key=lambda b: b[0])
 
+        GAP_PX = 2        # tighter than previous 5 px
+        MIN_W = 4         # ignore blobs thinner than this (noise)
+
         merged = []  # list of [x0,y0,x1,y1]
         for b in boxes:
             x0, y0, w, h = b
+            if w < MIN_W:
+                continue  # too thin – likely noise or bar-line remnant
+
             x1, y1 = x0 + w, y0 + h
+
             if not merged:
                 merged.append([x0, y0, x1, y1])
                 continue
+
             prev = merged[-1]
-            # If this box starts very close (≤5 px) to previous right edge → same number
-            if x0 - prev[2] <= 5:  # horizontal gap ≤5 px
-                # expand previous
+            # Merge only if the gap is extremely small (≤ GAP_PX)
+            if x0 - prev[2] <= GAP_PX:
                 prev[2] = max(prev[2], x1)
                 prev[1] = min(prev[1], y0)
                 prev[3] = max(prev[3], y1)
             else:
                 merged.append([x0, y0, x1, y1])
+
+        # Optionally split overly wide boxes that may still contain two digits
+        split_boxes = []
+        for x0, y0, x1, y1 in merged:
+            w_box = x1 - x0
+            h_box_local = y1 - y0
+            if w_box > 1.4 * h_box_local:
+                # vertical projection to find minimal column sum between 30-70 % width
+                col_sum = digits_mask[y0:y1, x0:x1].sum(axis=0)
+                mid_lo = int(w_box * 0.3)
+                mid_hi = int(w_box * 0.7)
+                if mid_hi > mid_lo:
+                    split_idx = int(np.argmin(col_sum[mid_lo:mid_hi]) + mid_lo)
+                    split_boxes.append((x0, y0, x0 + split_idx, y1))
+                    split_boxes.append((x0 + split_idx, y0, x1, y1))
+                    continue
+            split_boxes.append((x0, y0, x1, y1))
+
+        merged = [(x0, y0, x1, y1) for (x0, y0, x1, y1) in split_boxes]
 
         annotated = roi_bgr.copy()
 
@@ -1164,6 +1194,19 @@ class GuitarTrainerApp(Gtk.Window):
 
         cv2.imwrite("tab_boxes.png", annotated)
         print("[DEBUG] Digit boxes saved → tab_boxes.png")
+
+        numbers = []
+        if preds:
+            cur = preds[0][2]                 # first digit
+            prev_x1 = preds[0][1]
+            for x0, x1, d in preds[1:]:
+                if x0 - prev_x1 <= 2:         # continuation of same fret number
+                    cur = cur*10 + d
+                else:
+                    numbers.append(cur)
+                    cur = d
+                prev_x1 = x1
+            numbers.append(cur)
 
 
 if __name__ == '__main__':

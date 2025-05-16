@@ -66,7 +66,7 @@ except AttributeError:
 # Synthetic image generator
 # -----------------------------------------------------------------------------
 CHARS = [str(n) for n in range(10)]  # individual digits used to compose 0-24
-LABELS = list(range(25))  # fret numbers 0-24 inclusive
+LABELS = list(range(10))  # fret numbers 0-9 only
 IMG_SIZE = 40  # output image is IMG_SIZE×IMG_SIZE grayscale
 
 def _load_fonts(extra_fonts: List[Path] | None = None) -> List[ImageFont.FreeTypeFont]:
@@ -107,7 +107,7 @@ FONTS = _load_fonts(extra_fonts=[Path(p) for p in EXTRA_FONTS])
 def _generate_sample(label: int, *, fonts: List[ImageFont.FreeTypeFont] | None = None, line_prob: float = 0.3) -> Tuple[np.ndarray, int]:
     """Return *(image, label)* with digit white-on-black."""
 
-    assert 0 <= label <= 24
+    assert 0 <= label <= 9
 
     # Canvas: *black* or *white* with 50 % probability
     bg_white  = random.random() < 0.5
@@ -217,7 +217,7 @@ def _generate_sample_realistic(label: int, *, fonts: List[ImageFont.FreeTypeFont
     The output is still a 40×40 monochrome crop with *white* digit on black.
     """
 
-    assert 0 <= label <= 24
+    assert 0 <= label <= 9
     IMG_W, IMG_H = IMG_SIZE, IMG_SIZE
     bg_colour = 0  # black background
     img = Image.new("L", (IMG_W, IMG_H), color=bg_colour)
@@ -308,7 +308,7 @@ class TabDigitSequence(keras.utils.Sequence):
         x = np.zeros((self.batch_size, IMG_SIZE, IMG_SIZE, 1), dtype=np.float32)
         y = np.zeros((self.batch_size,), dtype=np.int32)
         for i in range(self.batch_size):
-            lbl = random.randint(0, 24)
+            lbl = random.randint(0, 9)
             img, lab = _generate_sample(lbl, fonts=self.fonts, line_prob=self.line_prob)
             x[i] = img; y[i] = lab
         return x, keras.utils.to_categorical(y, num_classes=len(LABELS))
@@ -369,7 +369,7 @@ def main():  # noqa: C901
         preview_dir = out_dir / "preview"
         preview_dir.mkdir(parents=True, exist_ok=True)
         for i in range(25):
-            label = random.randint(0, 24)
+            label = random.randint(0, 9)
             arr, lbl = gen_fn(label, fonts=fonts, line_prob=args.line_prob)
             # Save in the same polarity used at inference time: white digit on black
             img = arr[:, :, 0] * 255.0
@@ -389,7 +389,7 @@ def main():  # noqa: C901
             x = np.zeros((self.batch_size, IMG_SIZE, IMG_SIZE, 1), dtype=np.float32)
             y = np.zeros((self.batch_size,), dtype=np.int32)
             for i in range(self.batch_size):
-                lbl = random.randint(0, 24)
+                lbl = random.randint(0, 9)
                 img, lab = self.gen_fn(lbl, fonts=self.fonts, line_prob=self.line_prob)
                 x[i] = img; y[i] = lab
             return x, keras.utils.to_categorical(y, num_classes=len(LABELS))
@@ -410,8 +410,6 @@ def main():  # noqa: C901
         validation_data=val_gen,
         epochs=args.epochs,
         callbacks=callbacks,
-        workers=4,
-        use_multiprocessing=True,
     )
 
     print("Training finished — saving final model…")
