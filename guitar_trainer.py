@@ -171,69 +171,7 @@ class GuitarTrainerApp(Gtk.Window):
             self.videosink = Gst.ElementFactory.make("gtkglsink", "videosink")
             if not self.videosink:
                 print("gtkglsink not available, trying gtksink")
-                self.videosink = Gst.ElementFactory.make(
-                    "gtksink", "videosink")
-
-            if self.videosink:
-                try:
-                    # Make sure video frames are displayed in sync with the pipeline clock
-                    self.videosink.set_property("sync", True)
-                    print("Set videosink sync property to True")
-                except TypeError:
-                    print("Could not set sync property on videosink")
-                    pass  # some versions may not expose the property
-
-            # Build the audio sink description dynamically so the application
-            # still works on systems that do *not* have the aubioonset plugin
-            # installed.  We test once and only add the onset branch when the
-            # element is available.
-
-            has_aubioonset = Gst.ElementFactory.find("aubioonset") is not None
-
-            base_desc = (
-                "audioconvert ! audioresample ! scaletempo name=st ! tee name=split "
-                # ──── audible playback (keeps sync=true so speed changes are heard)
-                "split. ! queue max-size-time=0 max-size-buffers=0 ! audioconvert ! audioresample ! autoaudiosink sync=true "
-                # ──── pitch detector branch
-                "split. ! queue ! audioconvert ! audioresample ! capsfilter caps=audio/x-raw,format=F32LE,channels=1 ! "
-                "appsink name=pitchsink emit-signals=true sync=false max-buffers=5 drop=true "
-            )
-
-            onset_desc = ""
-            if has_aubioonset:
-                onset_desc = "split. ! queue ! aubioonset name=onsetsink ! fakesink"
-            else:
-                # Fallback: create an appsink for Python-side onset detection
-                print("aubioonset element not found — using librosa onset detection fallback")
-                onset_desc = (
-                    "split. ! queue ! audioconvert ! audioresample ! "
-                    "capsfilter caps=audio/x-raw,format=F32LE,channels=1 ! "
-                    "appsink name=onsetsink emit-signals=true sync=false max-buffers=5 drop=true"
-                )
-
-            audio_sink_desc = base_desc + onset_desc
-            self.audio_sink_bin = Gst.parse_bin_from_description(
-                audio_sink_desc, True)
-
-            # Retrieve the appsink for pitch detection
-            self.pitchsink = self.audio_sink_bin.get_by_name("pitchsink")
-            if self.pitchsink:
-                self.pitchsink.connect("new-sample", self.on_pitch_sample)
-
-            # Retrieve the aubioonset element for onset detection so we can
-            # identify its messages on the bus later.
-            self.onsetsink = self.audio_sink_bin.get_by_name("onsetsink")
-
-            # If the onsetsink is an appsink (fallback), connect signal handler
-            if self.onsetsink and isinstance(self.onsetsink, GstApp.AppSink):
-                self.onsetsink.connect("new-sample", self.on_onset_sample)
-
-            # Retrieve the scaletempo element and make sure it's set up correctly
-            self.scaletempo = self.audio_sink_bin.get_by_name("st")
-            if self.scaletempo:
-                self.scaletempo.set_property("stride", 30)
-                self.scaletempo.set_property("overlap", 0.2)
-                print("Configured scaletempo element")
+                self.videosink = Gst.ElementFactory.make("gtksink", "videosink")
 
             if not self.playbin or not self.videosink:
                 print("Failed to create elements")
@@ -247,34 +185,12 @@ class GuitarTrainerApp(Gtk.Window):
                 for child in self.video_area.get_children():
                     self.video_area.remove(child)
 
-                # Create an overlay to hold video + pitch label
-                overlay = Gtk.Overlay()
-                overlay.set_hexpand(True)
-                overlay.set_vexpand(True)
-
-                # Add video widget first
-                overlay.add(sink_widget)
-
-                # Pitch label (top-left)
-                self.pitch_label = Gtk.Label(label="")
-                self.pitch_label.set_halign(Gtk.Align.START)
-                self.pitch_label.set_valign(Gtk.Align.START)
-                self.pitch_label.set_margin_start(10)
-                self.pitch_label.set_margin_top(10)
-                # Style: yellow text for visibility
-                self.pitch_label.override_color(
-                    Gtk.StateFlags.NORMAL, Gdk.RGBA(1, 1, 0, 1))
-                overlay.add_overlay(self.pitch_label)
-
-                # TAB highlighting overlay disabled (removed)
-
-                self.video_area.pack_start(overlay, True, True, 0)
+                # Add video widget directly to video area
+                self.video_area.pack_start(sink_widget, True, True, 0)
                 sink_widget.show()
-                overlay.show_all()
 
-            # Set up the sinks
+            # Set up the video sink
             self.playbin.set_property("video-sink", self.videosink)
-            self.playbin.set_property("audio-sink", self.audio_sink_bin)
 
             # Add playbin to pipeline
             self.pipeline.add(self.playbin)
@@ -321,16 +237,8 @@ class GuitarTrainerApp(Gtk.Window):
         elif t == Gst.MessageType.STATE_CHANGED:
             if message.src == self.pipeline:
                 old_state, new_state, pending_state = message.parse_state_changed()
-                print(
-                    f"Pipeline state changed from {old_state.value_nick} to {new_state.value_nick}")
+                print(f"Pipeline state changed from {old_state.value_nick} to {new_state.value_nick}")
                 self.update_status(f"Player {new_state.value_nick}")
-        elif t == Gst.MessageType.TAG:
-            # aubioonset posts TAG messages with an "onset" tag each time it
-            # detects a new attack.  We advance the TAB cursor (or simply log
-            # for now) when we receive one.
-            if message.src == getattr(self, "onsetsink", None):
-                # Any TAG message from onsetsink corresponds to an onset.
-                GLib.idle_add(self.on_onset_detected)
 
     def on_download_clicked(self, button):
         url = self.url_entry.get_text()
@@ -378,13 +286,6 @@ class GuitarTrainerApp(Gtk.Window):
             print(f"Pipeline state change result: {ret}")
             ret = self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
             print(f"Pipeline get_state result: {ret}")
-            # Reset scaletempo kick flag for new video
-            self.scaletempo_kicked = False
-            # NOTE: We deliberately *avoid* performing an initial seek while the
-            # pipeline is still in the PAUSED state because doing so prevents
-            # audio from being heard once playback starts.  The correct flush
-            # seek is instead issued from on_play_clicked after we have moved
-            # the pipeline to PLAYING.
 
             if ret[0] == Gst.StateChangeReturn.SUCCESS:
                 self.update_status("Video ready to play")
@@ -398,30 +299,13 @@ class GuitarTrainerApp(Gtk.Window):
             self.pitch_buffer = None  # reset analysis buffer
             print("Play button clicked")
 
-            speed = self.speed_scale.get_value()
-            if abs(speed - 1.0) < 1e-6:
-                speed = 1.0001
-                print('Rate was 1.0 → nudged to 1.000 (scaletempo “kick”)')
-
-            # Start pipeline
             ret = self.pipeline.set_state(Gst.State.PLAYING)
             print(f"Play state change result: {ret}")
 
-            # Wait for state change to complete (i.e. pipeline reaches PLAYING)
             state_change = self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
             print(f"Pipeline get_state result after play: {state_change}")
 
-            # Query current position (should be 0 on first play)
-            success, position = self.pipeline.query_position(Gst.Format.TIME)
-            if not success:
-                position = 0
-
-            # Now do a single seek (with rate nudge if needed) so scaletempo “kicks” robustly and audio starts immediately.
-            flags = Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE
-            result = self.pipeline.seek(speed, Gst.Format.TIME, flags, Gst.SeekType.SET, position, Gst.SeekType.NONE, -1)
-            print(f"Seek result: {result}")
-
-            if state_change[0] == Gst.StateChangeReturn.SUCCESS and result:
+            if state_change[0] == Gst.StateChangeReturn.SUCCESS:
                 self.update_status("Playing")
                 if not self.frame_captured:
                     GLib.timeout_add(400, self._capture_first_frame)
@@ -727,8 +611,6 @@ class GuitarTrainerApp(Gtk.Window):
         # Preroll (PAUSED) so first frame is available
         self.pipeline.set_state(Gst.State.PAUSED)
         self.update_status("Local video ready – press Play")
-        # Reset scaletempo kick flag for new video
-        self.scaletempo_kicked = False
 
     # --------------------------------------------------------------
     # Poll videosink.last-sample until we capture a bright frame
