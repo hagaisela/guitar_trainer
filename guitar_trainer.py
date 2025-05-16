@@ -173,7 +173,13 @@ class GuitarTrainerApp(Gtk.Window):
                 print("gtkglsink not available, trying gtksink")
                 self.videosink = Gst.ElementFactory.make("gtksink", "videosink")
 
-            if not self.playbin or not self.videosink:
+            # Create audio sink bin with format conversion
+            audio_sink_desc = (
+                "audioconvert ! audioresample ! autoaudiosink"
+            )
+            self.audio_sink_bin = Gst.parse_bin_from_description(audio_sink_desc, True)
+
+            if not self.playbin or not self.videosink or not self.audio_sink_bin:
                 print("Failed to create elements")
                 self.update_status("Failed to create video player")
                 return
@@ -189,8 +195,9 @@ class GuitarTrainerApp(Gtk.Window):
                 self.video_area.pack_start(sink_widget, True, True, 0)
                 sink_widget.show()
 
-            # Set up the video sink
+            # Set up the sinks
             self.playbin.set_property("video-sink", self.videosink)
+            self.playbin.set_property("audio-sink", self.audio_sink_bin)
 
             # Add playbin to pipeline
             self.pipeline.add(self.playbin)
