@@ -65,6 +65,11 @@ class GuitarTrainerApp(Gtk.Window):
         self.pipeline = None
         self.playbin = None
         self.videosink = None
+        self.pitch_appsink = None  # For pitch detection
+        self.pitch_buffer = None  # For accumulating audio samples
+        self.recent_pitches = deque(maxlen=5)  # Keep last 5 pitches for smoothing
+        self.last_position = 0  # Track last playback position
+        self.is_playing = False  # Track play state
 
         # Create main layout
         self.main_box = Gtk.Box(
@@ -85,6 +90,11 @@ class GuitarTrainerApp(Gtk.Window):
         # Status label
         self.status_label = Gtk.Label(label="")
         self.main_box.pack_start(self.status_label, False, False, 0)
+
+        # Pitch label
+        self.pitch_label = Gtk.Label(label="")
+        self.pitch_label.set_markup("<span size='x-large'>-</span>")
+        self.main_box.pack_start(self.pitch_label, False, False, 0)
 
         # Video area
         self.video_area = Gtk.Box()  # Changed from DrawingArea to Box
@@ -126,9 +136,6 @@ class GuitarTrainerApp(Gtk.Window):
 
         # Initialize video path
         self.video_path = None
-        self.pitch_buffer = None  # numpy array for accumulating audio samples
-        self.recent_pitches = deque(maxlen=5)
-        # TAB-highlight state
         self.tab_bbox = None        # (x, y, w, h) of tab area in video coords
         self.tab_col = -1           # current column index
         self.col_width = 80         # pixel width per TAB column (heuristic)
@@ -173,11 +180,28 @@ class GuitarTrainerApp(Gtk.Window):
                 print("gtkglsink not available, trying gtksink")
                 self.videosink = Gst.ElementFactory.make("gtksink", "videosink")
 
-            # Create audio sink bin with format conversion
+            # Create audio sink bin with tee for branching
             audio_sink_desc = (
-                "audioconvert ! audioresample ! autoaudiosink"
+                "tee name=audio_tee ! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 ! "
+                "audioconvert ! audioresample ! autoaudiosink sync=false "
+                "audio_tee. ! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 ! "
+                "audioconvert ! audioresample ! capsfilter caps=audio/x-raw,format=F32LE,channels=1 ! "
+                "appsink name=pitch_appsink sync=false max-buffers=1 drop=true"
             )
+            print(f"Creating audio sink bin with description: {audio_sink_desc}")
             self.audio_sink_bin = Gst.parse_bin_from_description(audio_sink_desc, True)
+            if not self.audio_sink_bin:
+                print("Failed to create audio sink bin")
+                return
+
+            # Get the appsink from the bin
+            self.pitch_appsink = self.audio_sink_bin.get_by_name("pitch_appsink")
+            if not self.pitch_appsink:
+                print("Failed to get pitch_appsink from bin")
+                return
+            print("Got pitch_appsink from bin")
+            self.pitch_appsink.set_property("emit-signals", True)
+            self.pitch_appsink.connect("new-sample", self.on_pitch_sample)
 
             if not self.playbin or not self.videosink or not self.audio_sink_bin:
                 print("Failed to create elements")
@@ -196,8 +220,10 @@ class GuitarTrainerApp(Gtk.Window):
                 sink_widget.show()
 
             # Set up the sinks
+            print("Setting up playbin sinks")
             self.playbin.set_property("video-sink", self.videosink)
             self.playbin.set_property("audio-sink", self.audio_sink_bin)
+            self.playbin.set_property("flags", 0x00000001 | 0x00000002)  # VIDEO | AUDIO
 
             # Add playbin to pipeline
             self.pipeline.add(self.playbin)
@@ -219,6 +245,7 @@ class GuitarTrainerApp(Gtk.Window):
                     GLib.idle_add(self.resize, w, h + 140)
         except Exception as e:
             print(f"Error setting up pipeline: {e}")
+            traceback.print_exc()  # Print full stack trace
             self.update_status(f"Error setting up video player: {str(e)}")
 
     def on_pad_added(self, element, pad):
@@ -237,15 +264,85 @@ class GuitarTrainerApp(Gtk.Window):
             err, debug = message.parse_error()
             print(f"Error: {err}, Debug: {debug}")
             self.update_status(f"Playback error: {err}")
+            # Reset state on error
+            self.is_playing = False
+            self.pipeline.set_state(Gst.State.NULL)
         elif t == Gst.MessageType.EOS:
             print("End of stream")
             self.pipeline.set_state(Gst.State.NULL)
+            self.is_playing = False
+            self.last_position = 0
             self.update_status("Playback finished")
         elif t == Gst.MessageType.STATE_CHANGED:
             if message.src == self.pipeline:
                 old_state, new_state, pending_state = message.parse_state_changed()
                 print(f"Pipeline state changed from {old_state.value_nick} to {new_state.value_nick}")
+                if new_state == Gst.State.PLAYING:
+                    print("Pipeline is now playing - audio should start flowing")
+                    self.is_playing = True
+                elif new_state == Gst.State.PAUSED:
+                    self.is_playing = False
+                elif new_state == Gst.State.NULL:
+                    self.is_playing = False
                 self.update_status(f"Player {new_state.value_nick}")
+        elif t == Gst.MessageType.STREAM_STATUS:
+            status = message.parse_stream_status()
+            print(f"Stream status: {status.type.value_nick}")
+            if status.type == Gst.StreamStatusType.ERROR:
+                print("Stream error, resetting pipeline")
+                self.pipeline.set_state(Gst.State.NULL)
+                self.is_playing = False
+                self.last_position = 0
+        elif t == Gst.MessageType.NEW_CLOCK:
+            print("New clock selected")
+        elif t == Gst.MessageType.STREAM_START:
+            print("Stream started")
+        elif t == Gst.MessageType.ASYNC_DONE:
+            print("Async done")
+            # Update position after async operations
+            if self.is_playing:
+                success, position = self.pipeline.query_position(Gst.Format.TIME)
+                if success:
+                    self.last_position = position
+                    print(f"Updated position: {position}")
+        elif t == Gst.MessageType.TAG:
+            tag_list = message.parse_tag()
+            print(f"Tags: {tag_list.to_string()}")
+        elif t == Gst.MessageType.BUFFERING:
+            percent = message.parse_buffering()
+            print(f"Buffering: {percent}%")
+        elif t == Gst.MessageType.DURATION_CHANGED:
+            print("Duration changed")
+        elif t == Gst.MessageType.LATENCY:
+            print("Latency message")
+        elif t == Gst.MessageType.STREAM_COLLECTION:
+            print("Stream collection")
+        elif t == Gst.MessageType.STREAMS_SELECTED:
+            print("Streams selected")
+        elif t == Gst.MessageType.REDIRECT:
+            print("Redirect message")
+        elif t == Gst.MessageType.ELEMENT:
+            print(f"Element message: {message.src.get_name()}")
+        elif t == Gst.MessageType.SEGMENT_START:
+            print("Segment start")
+        elif t == Gst.MessageType.SEGMENT_DONE:
+            print("Segment done")
+        elif t == Gst.MessageType.TOC:
+            print("TOC message")
+        elif t == Gst.MessageType.PROPERTY_NOTIFY:
+            print("Property notify")
+        elif t == Gst.MessageType.QOS:
+            print("QOS message")
+        elif t == Gst.MessageType.SEEK_DONE:
+            print("Seek done")
+        elif t == Gst.MessageType.NEED_CONTEXT:
+            print("Need context")
+        elif t == Gst.MessageType.HAVE_CONTEXT:
+            print("Have context")
+        elif t == Gst.MessageType.ANY:
+            print("Any message")
+        else:
+            print(f"Unhandled message type: {t.value_nick}")
 
     def on_download_clicked(self, button):
         url = self.url_entry.get_text()
@@ -306,6 +403,26 @@ class GuitarTrainerApp(Gtk.Window):
             self.pitch_buffer = None  # reset analysis buffer
             print("Play button clicked")
 
+            if self.is_playing:
+                print("Already playing, ignoring play request")
+                return
+
+            # If we have a saved position, seek to it first
+            if self.last_position > 0:
+                print(f"Seeking to saved position: {self.last_position}")
+                flags = Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE
+                result = self.pipeline.seek(
+                    1.0,  # rate
+                    Gst.Format.TIME,
+                    flags,
+                    Gst.SeekType.SET,
+                    self.last_position,
+                    Gst.SeekType.NONE,
+                    -1
+                )
+                if not result:
+                    print("Failed to seek to saved position")
+
             ret = self.pipeline.set_state(Gst.State.PLAYING)
             print(f"Play state change result: {ret}")
 
@@ -314,13 +431,21 @@ class GuitarTrainerApp(Gtk.Window):
 
             if state_change[0] == Gst.StateChangeReturn.SUCCESS:
                 self.update_status("Playing")
+                self.is_playing = True
                 if not self.frame_captured:
                     GLib.timeout_add(400, self._capture_first_frame)
             else:
                 self.update_status("Failed to play video")
+                print(f"Failed to play: {state_change}")
 
     def on_pause_clicked(self, button):
         if self.playbin:
+            # Save current position before pausing
+            success, position = self.pipeline.query_position(Gst.Format.TIME)
+            if success:
+                self.last_position = position
+                print(f"Saved position: {position}")
+
             ret = self.pipeline.set_state(Gst.State.PAUSED)
             print(f"Pause state change result: {ret}")
 
@@ -330,8 +455,10 @@ class GuitarTrainerApp(Gtk.Window):
 
             if ret[0] == Gst.StateChangeReturn.SUCCESS:
                 self.update_status("Paused")
+                self.is_playing = False
             else:
                 self.update_status("Failed to pause video")
+                print(f"Failed to pause: {ret}")
 
     def on_speed_changed(self, scale):
         speed = scale.get_value()
@@ -395,9 +522,12 @@ class GuitarTrainerApp(Gtk.Window):
         rate = caps.get_structure(0).get_value("rate")
         channels = caps.get_structure(0).get_value("channels")
 
+        print(f"Got audio sample: rate={rate}, channels={channels}")
+
         # Map buffer to numpy array
         success, mapinfo = buf.map(Gst.MapFlags.READ)
         if not success:
+            print("Failed to map buffer")
             return Gst.FlowReturn.ERROR
 
         try:
@@ -413,6 +543,8 @@ class GuitarTrainerApp(Gtk.Window):
                 block = block.reshape(-1, channels)
                 block = block.mean(axis=1)  # mixdown to mono
 
+            print(f"Got audio block: shape={block.shape}, dtype={block.dtype}")
+
             # append to rolling buffer
             if self.pitch_buffer is None:
                 self.pitch_buffer = block.copy()
@@ -424,6 +556,7 @@ class GuitarTrainerApp(Gtk.Window):
 
             # only analyse when we have enough samples
             if len(self.pitch_buffer) < FRAME:
+                print(f"Not enough samples yet: {len(self.pitch_buffer)} < {FRAME}")
                 return Gst.FlowReturn.OK
 
             data = self.pitch_buffer[:FRAME]
@@ -433,12 +566,14 @@ class GuitarTrainerApp(Gtk.Window):
             FMIN = librosa.note_to_hz('E2')  # 82 Hz
             FMAX = librosa.note_to_hz('E6')  # 1319 Hz
 
+            print(f"Running pitch detection on {len(data)} samples")
             f0, voiced_flag, _ = librosa.pyin(data, fmin=FMIN, fmax=FMAX,
                                               sr=rate, frame_length=FRAME,
                                               hop_length=len(data)-1)
 
             voiced = f0[voiced_flag]
             if voiced.size == 0:
+                print("No voiced frames detected")
                 return Gst.FlowReturn.OK
 
             freq = float(np.median(voiced))
@@ -446,9 +581,9 @@ class GuitarTrainerApp(Gtk.Window):
             freq_smoothed = float(np.median(self.recent_pitches))
 
             note = self.freq_to_note_name(freq_smoothed)
-            # print(f"Detected pitch: {note} {freq_smoothed:.0f}Hz")
-            GLib.idle_add(self.pitch_label.set_text,
-                          f"{note} ({freq_smoothed:.0f} Hz)")
+            print(f"Detected pitch: {note} ({freq_smoothed:.0f} Hz)")
+            GLib.idle_add(self.pitch_label.set_markup,
+                          f"<span size='x-large'>{note} ({freq_smoothed:.0f} Hz)</span>")
         finally:
             buf.unmap(mapinfo)
 
