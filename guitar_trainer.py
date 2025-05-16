@@ -149,6 +149,8 @@ class GuitarTrainerApp(Gtk.Window):
                 GLib.idle_add(self.load_local_video)
                 break
 
+        self.scaletempo_kicked = False  # Track if scaletempo has been kicked for this video
+
         print("GuitarTrainerApp initialization complete")
 
     def update_status(self, message):
@@ -372,29 +374,17 @@ class GuitarTrainerApp(Gtk.Window):
             uri = f"file://{os.path.abspath(self.video_path)}"
             print(f"Setting URI: {uri}")
             self.playbin.set_property("uri", uri)
-
-            # Set initial state to PAUSED to preroll the pipeline
             ret = self.pipeline.set_state(Gst.State.PAUSED)
             print(f"Pipeline state change result: {ret}")
-
-            # Wait for the state change to complete
             ret = self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
             print(f"Pipeline get_state result: {ret}")
-
-            # Initialize the first seek now, to ensure the speed is correctly set
-            # This addresses the issue of video playback speed
-            speed = self.speed_scale.get_value()
-            print(f"Setting initial playback speed to {speed}")
-            result = self.pipeline.seek(
-                speed,  # rate
-                Gst.Format.TIME,
-                Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE,
-                Gst.SeekType.SET,
-                0,  # start position
-                Gst.SeekType.NONE,
-                -1  # we don't specify an end time
-            )
-            print(f"Initial seek result: {result}")
+            # Reset scaletempo kick flag for new video
+            self.scaletempo_kicked = False
+            # NOTE: We deliberately *avoid* performing an initial seek while the
+            # pipeline is still in the PAUSED state because doing so prevents
+            # audio from being heard once playback starts.  The correct flush
+            # seek is instead issued from on_play_clicked after we have moved
+            # the pipeline to PLAYING.
 
             if ret[0] == Gst.StateChangeReturn.SUCCESS:
                 self.update_status("Video ready to play")
@@ -408,18 +398,31 @@ class GuitarTrainerApp(Gtk.Window):
             self.pitch_buffer = None  # reset analysis buffer
             print("Play button clicked")
 
-            # Set to PLAYING state
+            speed = self.speed_scale.get_value()
+            if abs(speed - 1.0) < 1e-6:
+                speed = 1.0001
+                print('Rate was 1.0 → nudged to 1.000 (scaletempo “kick”)')
+
+            # Start pipeline
             ret = self.pipeline.set_state(Gst.State.PLAYING)
             print(f"Play state change result: {ret}")
 
-            # Wait for the state change to complete
-            ret = self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
-            print(f"Pipeline get_state result after play: {ret}")
+            # Wait for state change to complete (i.e. pipeline reaches PLAYING)
+            state_change = self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
+            print(f"Pipeline get_state result after play: {state_change}")
 
-            if ret[0] == Gst.StateChangeReturn.SUCCESS:
+            # Query current position (should be 0 on first play)
+            success, position = self.pipeline.query_position(Gst.Format.TIME)
+            if not success:
+                position = 0
+
+            # Now do a single seek (with rate nudge if needed) so scaletempo “kicks” robustly and audio starts immediately.
+            flags = Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE
+            result = self.pipeline.seek(speed, Gst.Format.TIME, flags, Gst.SeekType.SET, position, Gst.SeekType.NONE, -1)
+            print(f"Seek result: {result}")
+
+            if state_change[0] == Gst.StateChangeReturn.SUCCESS and result:
                 self.update_status("Playing")
-
-                # Start trying to capture a non-black frame (once per 0.4 s)
                 if not self.frame_captured:
                     GLib.timeout_add(400, self._capture_first_frame)
             else:
@@ -507,8 +510,14 @@ class GuitarTrainerApp(Gtk.Window):
             return Gst.FlowReturn.ERROR
 
         try:
-            # audio/x-raw float32 interleaved
-            block = np.frombuffer(mapinfo.data, dtype=np.float32)
+            # audio/x-raw float32 interleaved — mapinfo.data may be bytes,
+            # memoryview *or* (with newer GI bindings) a list[int].  Ensure
+            # we always hand a real bytes-like buffer to NumPy.
+            buf_data = mapinfo.data
+            if not isinstance(buf_data, (bytes, bytearray, memoryview)):
+                buf_data = bytes(buf_data)
+
+            block = np.frombuffer(buf_data, dtype=np.float32)
             if channels > 1:
                 block = block.reshape(-1, channels)
                 block = block.mean(axis=1)  # mixdown to mono
@@ -658,7 +667,14 @@ class GuitarTrainerApp(Gtk.Window):
             return Gst.FlowReturn.ERROR
 
         try:
-            block = np.frombuffer(mapinfo.data, dtype=np.float32)
+            # audio/x-raw float32 interleaved — mapinfo.data may be bytes,
+            # memoryview *or* (with newer GI bindings) a list[int].  Ensure
+            # we always hand a real bytes-like buffer to NumPy.
+            buf_data = mapinfo.data
+            if not isinstance(buf_data, (bytes, bytearray, memoryview)):
+                buf_data = bytes(buf_data)
+
+            block = np.frombuffer(buf_data, dtype=np.float32)
         finally:
             buf.unmap(mapinfo)
 
@@ -711,6 +727,8 @@ class GuitarTrainerApp(Gtk.Window):
         # Preroll (PAUSED) so first frame is available
         self.pipeline.set_state(Gst.State.PAUSED)
         self.update_status("Local video ready – press Play")
+        # Reset scaletempo kick flag for new video
+        self.scaletempo_kicked = False
 
     # --------------------------------------------------------------
     # Poll videosink.last-sample until we capture a bright frame
