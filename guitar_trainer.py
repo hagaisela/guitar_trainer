@@ -108,6 +108,21 @@ class GuitarTrainerApp(Gtk.Window):
         self.video_area.set_vexpand(True)
         self.main_box.pack_start(self.video_area, True, True, 0)
 
+        # ------------------------------ NEW: Seek / Scrub bar ------------------------------
+        self.user_is_seeking = False  # Track if the user is currently dragging the bar
+        self.seek_scale = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0.0, 100.0, 1.0)  # range reset once video is loaded
+        self.seek_scale.set_hexpand(True)
+        self.seek_scale.set_draw_value(True)  # show formatted time
+        self.seek_scale.set_sensitive(False)  # becomes active once duration is known
+        self.seek_scale.connect("format-value", self._format_time)
+        # Receive mouse button events so we know when the user starts/ends dragging
+        self.seek_scale.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
+        self.seek_scale.connect("button-press-event", self._on_seek_button_press)
+        self.seek_scale.connect("button-release-event", self._on_seek_button_release)
+        self.main_box.pack_start(self.seek_scale, False, True, 0)
+        # -------------------------------------------------------------------------------
+
         # Ensure slider clicks warp directly to the clicked position
         settings = Gtk.Settings.get_default()  # pylint: disable=no-value-for-parameter
         if settings is not None:
@@ -165,6 +180,9 @@ class GuitarTrainerApp(Gtk.Window):
                 break
 
         self.scaletempo_kicked = False  # Track if scaletempo has been kicked for this video
+
+        # Periodically refresh the seek bar (every 500 ms)
+        GLib.timeout_add(500, self._update_seek_bar)
 
         print("GuitarTrainerApp initialization complete")
 
@@ -1193,6 +1211,64 @@ class GuitarTrainerApp(Gtk.Window):
         cv2.imwrite("tab_boxes.png", annotated)
         print("[DEBUG] Digit boxes saved → tab_boxes.png")
         # Future-work: stitch multi-digit boxes into full fret numbers
+
+    # -------------------------- NEW: Seek bar helpers --------------------------
+    def _format_time(self, scale, value):
+        """Return *value* (seconds) as mm:ss for the scale draw."""
+        minutes = int(value) // 60
+        seconds = int(value) % 60
+        return f"{minutes}:{seconds:02d}"
+
+    def _on_seek_button_press(self, widget, event):  # noqa: D401
+        """Remember that the user started dragging the seek bar."""
+        self.user_is_seeking = True
+        return False  # propagate
+
+    def _on_seek_button_release(self, widget, event):  # noqa: D401
+        """Perform a rate-preserving seek to the selected position."""
+        if not self.pipeline:
+            self.user_is_seeking = False
+            return False
+
+        target_seconds = self.seek_scale.get_value()
+        rate = self.speed_scale.get_value()
+        flags = Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE | Gst.SeekFlags.KEY_UNIT
+        self.pipeline.seek(
+            rate,
+            Gst.Format.TIME,
+            flags,
+            Gst.SeekType.SET,
+            int(target_seconds * Gst.SECOND),
+            Gst.SeekType.NONE,
+            -1,
+        )
+        self.last_position = int(target_seconds * Gst.SECOND)
+        self.user_is_seeking = False
+        # Provide visual feedback
+        self.update_status(f"Seeking to {self._format_time(None, target_seconds)}")
+        return False
+
+    def _update_seek_bar(self):
+        """Periodic timer to keep the seek scale in sync with playback."""
+        if not self.playbin or self.user_is_seeking:
+            return True  # continue timer
+
+        success_pos, position_ns = self.pipeline.query_position(Gst.Format.TIME)
+        success_dur, duration_ns = self.pipeline.query_duration(Gst.Format.TIME)
+
+        if success_dur and duration_ns > 0:
+            duration_sec = duration_ns / Gst.SECOND
+            # Enable and configure scale once duration is known
+            if not self.seek_scale.get_sensitive():
+                self.seek_scale.set_range(0.0, duration_sec)
+                self.seek_scale.set_sensitive(True)
+        else:
+            duration_sec = None
+
+        if success_pos and duration_sec:
+            self.seek_scale.set_value(position_ns / Gst.SECOND)
+        return True
+    # ---------------------------------------------------------------------------
 
 
 if __name__ == '__main__':
