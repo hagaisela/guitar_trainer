@@ -1063,128 +1063,126 @@ class GuitarTrainerApp(Gtk.Window):
     def detect_tab_digits(self, img_bgr, bbox):
         """Detect and annotate fret numbers inside *bbox* of *img_bgr*.
 
-        Saves an image with green rectangles and predicted digits to
-        'tab_boxes.png'.  Requires self.digit_model to be initialised.
+        The routine filters out the vertical "TAB" lettering that sits in the
+        extreme left margin and only accepts CNN predictions whose confidence
+        is ≥ 0.65.  Annotated boxes are saved to *tab_boxes.png* for debugging.
         """
         if self.digit_model is None or cv2 is None or np is None:
             return
 
         x0, y0, w_box, h_box = bbox
-        roi_bgr = img_bgr[y0:y0 + h_box, x0:x0 + w_box]
+        roi_bgr = img_bgr[y0 : y0 + h_box, x0 : x0 + w_box]
         gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
 
-        # Binary inverse threshold so digits are white (255) on black (0)
-        _, thresh_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # Threshold so digits are bright (255) on black (0)
+        _, thresh_inv = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        )
 
-        # Remove thin horizontal staff lines via morphological opening
+        # Remove the thin staff lines
         horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 1))
-        lines_removed = cv2.morphologyEx(thresh_inv, cv2.MORPH_OPEN, horiz_kernel, iterations=1)
+        lines_removed = cv2.morphologyEx(
+            thresh_inv, cv2.MORPH_OPEN, horiz_kernel, iterations=1
+        )
         digits_mask = cv2.bitwise_xor(thresh_inv, lines_removed)
 
-        # (Optional) vertical bar-line removal disabled; caused over-erosion on some videos
-        # vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(max(10, h_box * 0.8))))
-        # digits_mask = cv2.morphologyEx(digits_mask, cv2.MORPH_OPEN, vert_kernel, iterations=1)
-
-        # --------------------------------------------------------------
-        # Cluster contours that belong to the *same column* (multi-digit)
-        # --------------------------------------------------------------
-        boxes = []
-        contours, _ = cv2.findContours(digits_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # ------------------------------------------------------------------
+        # 1. Find candidate blobs (contours)
+        # ------------------------------------------------------------------
+        boxes = []  # each item → [x, y, w, h]
+        contours, _ = cv2.findContours(
+            digits_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
-            if h < 8 or w < 4:
+            if h < 8 or w < 4:  # very tiny – noise
                 continue
-            if h > h_box * 0.9:
+            if h > h_box * 0.9:  # way too tall – probably a bar-line artefact
                 continue
             boxes.append([x, y, w, h])
 
-        # Sort left-to-right
+        # ------------------------------------------------------------------
+        # 2. Drop anything that lives in the extreme left margin (vertical "TAB")
+        # ------------------------------------------------------------------
+        roi_w = digits_mask.shape[1]
+        LEFT_MARGIN_FRAC = 0.08  # ignore left-most 8 % of the ROI
+        boxes = [b for b in boxes if (b[0] + b[2]) > LEFT_MARGIN_FRAC * roi_w]
+
+        # ------------------------------------------------------------------
+        # 3. Sort left → right and merge blobs separated by ≤ 2 px
+        # ------------------------------------------------------------------
         boxes.sort(key=lambda b: b[0])
-
-        GAP_PX = 2        # tighter than previous 5 px
-        MIN_W = 4         # ignore blobs thinner than this (noise)
-
-        merged = []  # list of [x0,y0,x1,y1]
-        for b in boxes:
-            x0, y0, w, h = b
+        GAP_PX = 2
+        MIN_W = 4
+        merged = []  # [x0, y0, x1, y1]
+        for x, y, w, h in boxes:
             if w < MIN_W:
-                continue  # too thin – likely noise or bar-line remnant
-
-            x1, y1 = x0 + w, y0 + h
-
-            if not merged:
-                merged.append([x0, y0, x1, y1])
                 continue
-
-            prev = merged[-1]
-            # Merge only if the gap is extremely small (≤ GAP_PX)
-            if x0 - prev[2] <= GAP_PX:
-                prev[2] = max(prev[2], x1)
-                prev[1] = min(prev[1], y0)
-                prev[3] = max(prev[3], y1)
+            x1, y1 = x + w, y + h
+            if merged and x - merged[-1][2] <= GAP_PX:
+                # Extend previous box
+                merged[-1][2] = max(merged[-1][2], x1)
+                merged[-1][1] = min(merged[-1][1], y)
+                merged[-1][3] = max(merged[-1][3], y1)
             else:
-                merged.append([x0, y0, x1, y1])
+                merged.append([x, y, x1, y1])
 
-        # Optionally split overly wide boxes that may still contain two digits
+        # ------------------------------------------------------------------
+        # 4. Split unusually wide boxes (likely two digits stuck together)
+        # ------------------------------------------------------------------
         split_boxes = []
-        for x0, y0, x1, y1 in merged:
-            w_box = x1 - x0
-            h_box_local = y1 - y0
-            if w_box > 1.4 * h_box_local:
-                # vertical projection to find minimal column sum between 30-70 % width
-                col_sum = digits_mask[y0:y1, x0:x1].sum(axis=0)
-                mid_lo = int(w_box * 0.3)
-                mid_hi = int(w_box * 0.7)
+        for x0b, y0b, x1b, y1b in merged:
+            w_b = x1b - x0b
+            h_b = y1b - y0b
+            if w_b > 1.4 * h_b:
+                col_sum = digits_mask[y0b:y1b, x0b:x1b].sum(axis=0)
+                mid_lo = int(w_b * 0.3)
+                mid_hi = int(w_b * 0.7)
                 if mid_hi > mid_lo:
-                    split_idx = int(np.argmin(col_sum[mid_lo:mid_hi]) + mid_lo)
-                    split_boxes.append((x0, y0, x0 + split_idx, y1))
-                    split_boxes.append((x0 + split_idx, y0, x1, y1))
+                    split_idx = x0b + mid_lo + int(np.argmin(col_sum[mid_lo:mid_hi]))
+                    split_boxes.append((x0b, y0b, split_idx, y1b))
+                    split_boxes.append((split_idx, y0b, x1b, y1b))
                     continue
-            split_boxes.append((x0, y0, x1, y1))
+            split_boxes.append((x0b, y0b, x1b, y1b))
 
-        merged = [(x0, y0, x1, y1) for (x0, y0, x1, y1) in split_boxes]
-
+        # ------------------------------------------------------------------
+        # 5. Classify each cropped blob with the CNN
+        # ------------------------------------------------------------------
         annotated = roi_bgr.copy()
+        PAD = 4
+        CONF_THRESH = 0.65  # << raised from 0.30 → 0.65
+        for i, (x0b, y0b, x1b, y1b) in enumerate(split_boxes):
+            # Pad crop slightly for safety
+            x0e = max(0, x0b - PAD)
+            y0e = max(0, y0b - PAD)
+            x1e = min(digits_mask.shape[1], x1b + PAD)
+            y1e = min(digits_mask.shape[0], y1b + PAD)
 
-        PAD = 4  # pixels of extra margin around each detected digit box
-
-        for i, (x0, y0, x1, y1) in enumerate(merged):
-            # Expand the box slightly to avoid clipping ascenders/descenders
-            x0e = max(0, x0 - PAD)
-            y0e = max(0, y0 - PAD)
-            x1e = min(digits_mask.shape[1], x1 + PAD)
-            y1e = min(digits_mask.shape[0], y1 + PAD)
-
-            crop_src = digits_mask[y0e:y1e, x0e:x1e]
-            # NEW: save the raw threshold crop *before* line removal so we can
-            # inspect whether horizontal staff lines are still present.  We
-            # invert colours for readability (black digits/lines on white).
+            crop_mask = digits_mask[y0e:y1e, x0e:x1e]
             raw_crop = thresh_inv[y0e:y1e, x0e:x1e]
             cv2.imwrite(f"debug_crop_raw_{i}.png", 255 - raw_crop)
-            # Invert colours so digits are black on white BEFORE _prep_digit_crop,
-            # which then flips again → digits white on black (matching training).
-            crop = cv2.bitwise_not(crop_src)
+
+            crop = cv2.bitwise_not(crop_mask)
             if crop.size == 0:
                 continue
-            # Pass crop as-is (white digits on black) to _prep_digit_crop,
-            # which will normalise and invert internally to match the model.
             inp = self._prep_digit_crop(crop)
-            cv2.imwrite(f"debug_crop_{i}.png",
-                        (inp[0, :, :, 0] * 255).astype(np.uint8))
+            cv2.imwrite(
+                f"debug_crop_{i}.png", (inp[0, :, :, 0] * 255).astype(np.uint8)
+            )
+
             try:
                 pred = self.digit_model.predict(inp, verbose=0)
                 conf = float(np.max(pred))
                 label = int(np.argmax(pred))
-                print(f"[DEBUG] box {i}: label={label} (conf={conf:.2f})")
             except Exception as exc:
                 print("[WARN] digit prediction failed:", exc)
                 continue
 
-            cv2.rectangle(annotated, (x0, y0), (x1, y1), (0, 255, 0), 1)
+            cv2.rectangle(annotated, (x0b, y0b), (x1b, y1b), (0, 255, 0), 1)
             cv2.putText(
                 annotated,
-                f"{label}" if conf >= 0.3 else "?",
-                (x0, y0 - 2),
+                str(label) if conf >= CONF_THRESH else "?",
+                (x0b, y0b - 2),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
                 (0, 0, 255),
@@ -1194,19 +1192,7 @@ class GuitarTrainerApp(Gtk.Window):
 
         cv2.imwrite("tab_boxes.png", annotated)
         print("[DEBUG] Digit boxes saved → tab_boxes.png")
-
-        numbers = []
-        if preds:
-            cur = preds[0][2]                 # first digit
-            prev_x1 = preds[0][1]
-            for x0, x1, d in preds[1:]:
-                if x0 - prev_x1 <= 2:         # continuation of same fret number
-                    cur = cur*10 + d
-                else:
-                    numbers.append(cur)
-                    cur = d
-                prev_x1 = x1
-            numbers.append(cur)
+        # Future-work: stitch multi-digit boxes into full fret numbers
 
 
 if __name__ == '__main__':
